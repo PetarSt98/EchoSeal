@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  echoseal-tx:
+    build: .
+    image: echoseal:latest
+    command: echoseal-tx --key ${KEY:-001122...}     # env KEY or default
+    devices:
+      - "/dev/snd:/dev/snd"      # ALSA / PulseAudio on Linux
+    environment:
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native   # for Pulse containers
+    # volumes: ["$XDG_RUNTIME_DIR/pulse:/run/user/1000/pulse"] # if Pulse socket
+
+  echoseal-rx:
+    image: echoseal:latest
+    command: echoseal-rx --key ${KEY:-001122...} /data/recording.wav
+    volumes:
+      - ./samples:/data          # mount recordings

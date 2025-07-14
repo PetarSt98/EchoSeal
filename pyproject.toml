@@ -1,0 +1,63 @@
+# -------------------------------------------------------------------------
+#  RTWM – Real-Time Audio Watermarking
+#  Uses PEP 621 metadata + Setuptools build backend
+# -------------------------------------------------------------------------
+
+[project]
+name            = "rtwm"
+version         = "0.2.0"
+description     = "Real-Time ultrasonic audio watermarking (TX + RX)"
+readme          = "README.md"
+authors         = [
+  { name = "RTWM Team", email = "contact@example.com" }
+]
+license         = { text = "MIT" }
+requires-python = ">=3.12"
+
+# ------------- runtime dependencies --------------------------------------
+dependencies = [
+  "numpy>=1.25",
+  "scipy>=1.11",
+  "sounddevice>=0.4",   # PortAudio wrapper (live TX)
+  "soundfile>=0.12",    # libsndfile wrapper (offline RX)
+  "cryptography>=41.0"  # AES-GCM
+]
+
+# ------------- optional / dev extras -------------------------------------
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "black>=24.1",
+  "flake8>=7.0",
+  "mypy>=1.8",
+  "matplotlib>=3.8"
+]
+
+# ------------- console entry-points --------------------------------------
+#  After install, you can run `rtwm-tx` or `rtwm-rx` from the shell.
+[project.scripts]
+rtwm-tx = "tx_app:main"
+rtwm-rx = "rx_app:main"
+
+# ------------- links ------------------------------------------------------
+[project.urls]
+Homepage     = "https://github.com/your-org/rtwm"
+BugTracker   = "https://github.com/your-org/rtwm/issues"
+Documentation = "https://github.com/your-org/rtwm/wiki"
+
+# -------------------------------------------------------------------------
+#  tooling configs (Black shown as example)
+# -------------------------------------------------------------------------
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+
+# -------------------------------------------------------------------------
+#  build backend
+# -------------------------------------------------------------------------
+[build-system]
+requires      = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -1,85 +1,88 @@
 """
-RT-Watermark-RX – Tkinter GUI
-• open audio file
-• provide AES key
-• Verify → shows Authentic / Tampered
+EchoSeal-RX – offline verifier GUI
 """
 from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os, soundfile as sf
+
 from rtwm.detector import WatermarkDetector
 
+HEX = "0123456789abcdefABCDEF"
 
-def load_key(path_or_hex: str) -> bytes:
-    if all(c in "0123456789abcdefABCDEF" for c in path_or_hex.strip()) and len(
-        path_or_hex.strip()
-    ) in (32, 48, 64):
-        return bytes.fromhex(path_or_hex.strip())
-    return open(os.path.expanduser(path_or_hex), "rb").read()
-
+def load_key(src: str) -> bytes:
+    s = src.strip()
+    if len(s) == 64 and all(c in HEX for c in s):
+        return bytes.fromhex(s)
+    return open(os.path.expanduser(s), "rb").read()
 
 class RxGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("RT-Watermark RX")
+        self.title("EchoSeal – Verifier")
         self.resizable(False, False)
+        ttk.Style(self).theme_use("clam")
 
-        frm = ttk.Frame(self, padding=12)
-        frm.grid(sticky="nsew")
+        frm = ttk.Frame(self, padding=16); frm.grid()
 
-        ttk.Label(frm, text="AES-GCM Key (hex or file):").grid(sticky="w")
-        self.key_var = tk.StringVar(value="00112233445566778899aabbccddeeff")
-        ttk.Entry(frm, width=50, textvariable=self.key_var).grid(row=0, column=1, pady=2)
+        ttk.Label(frm, text="XChaCha20 key (64 hex) or file:").grid(sticky="w")
+        self.key_var = tk.StringVar(value="0"*64)
+        ttk.Entry(frm, width=60, textvariable=self.key_var).grid(row=0, column=1, pady=4)
 
         ttk.Label(frm, text="Audio file:").grid(row=1, column=0, sticky="w")
         self.file_var = tk.StringVar()
-        file_entry = ttk.Entry(frm, width=50, textvariable=self.file_var)
-        file_entry.grid(row=1, column=1, pady=2)
-        ttk.Button(frm, text="Browse…", command=self._browse).grid(row=1, column=2, padx=4)
+        ttk.Entry(frm, width=60, textvariable=self.file_var).grid(row=1, column=1, pady=4)
+        ttk.Button(frm, text="Browse…", command=self._pick).grid(row=1, column=2, padx=4)
 
-        ttk.Button(frm, text="Verify", command=self._verify).grid(row=2, columnspan=3, pady=6)
+        self.verify_btn = ttk.Button(frm, text="Verify", command=self._verify)
+        self.verify_btn.grid(row=2, columnspan=3, pady=10)
 
-        self.result = ttk.Label(frm, text="Awaiting file", font=("Helvetica", 12, "bold"))
-        self.result.grid(row=3, columnspan=3, pady=(8, 0))
+        self.status = ttk.Label(frm, text="Awaiting file", font=("Helvetica", 11, "bold"))
+        self.status.grid(row=3, columnspan=3, pady=(6,0))
 
-        self.detector: WatermarkDetector | None = None
+        self._centre()
 
-    # --------------------------------------------------------------------- ui helpers
-    def _browse(self):
+    # UI helpers
+    def _pick(self):
         path = filedialog.askopenfilename(
-            title="Select audio file",
-            filetypes=[("audio", "*.wav *.flac *.aiff *.ogg *.mp3"), ("all", "*.*")],
+            title="Open audio", filetypes=[("Audio", "*.wav *.flac *.ogg *.m4a *.mp3"), ("All","*.*")]
         )
-        if path:
-            self.file_var.set(path)
+        if path: self.file_var.set(path)
 
+    # verification
     def _verify(self):
         path = self.file_var.get()
         if not os.path.isfile(path):
-            messagebox.showerror("No file", "Please select a valid audio file")
-            return
+            messagebox.showerror("No file", "Select a valid audio file."); return
         try:
             key = load_key(self.key_var.get())
+            if len(key) != 32:
+                raise ValueError("Need 64-hex chars / 32-byte key")
         except Exception as e:
-            messagebox.showerror("Key error", f"Failed to load key: {e}")
-            return
-        if self.detector is None or self.detector._aes is None or key != self.detector._aes._AESCipher__aes._key:  # noqa
-            self.detector = WatermarkDetector(key)
+            messagebox.showerror("Key error", str(e)); return
 
-        data, fs = sf.read(path, always_2d=False)
-        if fs != 48_000:
-            messagebox.showinfo(
-                "Resample required",
-                "For MVP please provide 48 kHz audio (your file is "
-                f"{fs/1000:.1f} kHz).",
-            )
-            return
+        try:
+            data, fs = sf.read(path, always_2d=False)
+        except Exception as e:
+            messagebox.showerror("Read error", str(e)); return
 
-        ok = self.detector.verify(data)
-        self.result["text"] = "✅  Authentic" if ok else "⚠️  Tampered / No Watermark"
-        self.result["foreground"] = "green" if ok else "red"
+        self.verify_btn["state"] = "disabled"; self.status.config(text="Checking…", foreground="black")
+        self.update_idletasks()
 
+        ok = WatermarkDetector(key).verify(data, fs)
+
+        self.verify_btn["state"] = "normal"
+        if ok:
+            self.status.config(text="✅  Authentic", foreground="green")
+        else:
+            self.status.config(text="⚠️  Tampered / No watermark", foreground="red")
+
+    def _centre(self):
+        self.update_idletasks()
+        w,h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth()-w)//2
+        y = (self.winfo_screenheight()-h)//2
+        self.geometry(f"+{x}+{y}")
 
 if __name__ == "__main__":
     RxGUI().mainloop()

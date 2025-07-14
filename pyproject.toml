@@ -18,9 +18,10 @@ requires-python = ">=3.12"
 dependencies = [
   "numpy>=1.25",
   "scipy>=1.11",
-  "sounddevice>=0.4",   # PortAudio wrapper (live TX)
-  "soundfile>=0.12",    # libsndfile wrapper (offline RX)
-  "cryptography>=41.0"  # AES-GCM
+  "sounddevice>=0.4",
+  "soundfile>=0.12",
+  "cryptography>=42.0",        # XChaCha20
+  "fastpolar>=0.3.1",          # fast SC & SCL dec
 ]
 
 # ------------- optional / dev extras -------------------------------------

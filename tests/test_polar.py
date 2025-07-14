@@ -1,11 +1,8 @@
 import os, numpy as np
-from rtwm.polar import polar_encode, polar_decode
+from rtwm.polar_fast import encode, decode, N_DEFAULT, K_DEFAULT
 
-N, K = 512, 344   # match TxParams defaults
-
-def test_encode_decode_roundtrip():
-    payload = os.urandom(K // 8)     # 43 bytes
-    code = polar_encode(payload, N=N, K=K)
-    assert code.size == N
-    decoded = polar_decode(code, N=N, K=K)
-    assert decoded == payload
+def test_polar_roundtrip():
+    payload = os.urandom(K_DEFAULT // 8)          # 56 bytes
+    code    = encode(payload)                     # defaults N=1024/K=448
+    assert code.size == N_DEFAULT
+    assert decode(code) == payload

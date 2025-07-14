@@ -1,30 +1,29 @@
 import os, pytest
-from cryptography.exceptions import InvalidTag
-from rtwm.crypto import AESCipher
+from rtwm.crypto import SecureChannel
+from rtwm.embedder import WatermarkEmbedder
+from rtwm.detector import WatermarkDetector
+import numpy as np
 
-FS   = 48_000
-SECS = 3
+FS, SECS = 48_000, 3
 
 def test_encrypt_decrypt_cycle():
-    key = os.urandom(16)
-    aes = AESCipher(key)
+    key = os.urandom(32)
+    sc  = SecureChannel(key)
     plaintext = b"Authenticated message 123"
-    blob = aes.encrypt(plaintext)
-    assert aes.decrypt(blob) == plaintext
+    blob = sc.seal(plaintext)
+    assert sc.open(blob) == plaintext
 
 def test_invalid_tag_detection():
-    key = os.urandom(16)
-    aes = AESCipher(key)
-    bad = bytearray(aes.encrypt(b"data"))
-    bad[-1] ^= 0x55          # flip one bit
-    with pytest.raises(InvalidTag):
-        aes.decrypt(bad)
+    key = os.urandom(32)
+    sc  = SecureChannel(key)
+    tampered = bytearray(sc.seal(b"data"))
+    tampered[-1] ^= 0x55
+    with pytest.raises(Exception):
+        sc.open(tampered)
 
 def test_wrong_key_fails():
-    key_tx = b"\x11" * 16
-    key_rx = b"\x22" * 16
-    speech = (np.random.randn(FS * SECS) * 0.05).astype(np.float32)
-    tx = WatermarkEmbedder(key_tx)
-    wm = tx.process(speech)
-    rx = WatermarkDetector(key_rx)
-    assert rx.verify(wm) is False, "decryption with wrong key should fail"
+    key_tx, key_rx = b"\x11"*32, b"\x22"*32
+    speech = (np.random.randn(FS*SECS) * 0.05).astype(np.float32)
+    wm  = WatermarkEmbedder(key_tx).process(speech)
+    ok  = WatermarkDetector(key_rx).verify(wm, FS)
+    assert ok is False

@@ -62,7 +62,7 @@ echoseal-rx --key <same‑key> path/to/recording.wav
 ```mermaid
 flowchart LR
     subgraph TX
-        mic --> enc[Encrypt + Polar (1024/448)]
+        mic --> enc["Encrypt + Polar (1024/448)"]
         enc --> hop[Hop‑band PN spread]
         hop --> spk
     end

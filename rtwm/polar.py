@@ -45,3 +45,15 @@ def polar_encode(payload: bytes, *, N: int = 512, K: int = 344) -> np.ndarray:
     u[frozen == 0] = m_bits
     x = _polar_transform(u) & 1
     return x.astype(np.uint8)
+
+def polar_decode(code: np.ndarray, *, N: int = 512, K: int = 344) -> bytes:
+    """
+    *Hard-decision* decode: apply inverse transform, strip frozen bits.
+    Works well because upstream encryption + PN spreading already gives
+    very low raw BER; for adversarial/noisy channels swap in SC decoder.
+    """
+    if code.size != N:
+        raise ValueError("wrong codeword length")
+    u = _polar_transform(code & 1) & 1
+    info = u[_frozen_mask(N, K) == 0]
+    return np.packbits(info).tobytes()

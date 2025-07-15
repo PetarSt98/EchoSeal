@@ -45,7 +45,7 @@ def db_to_lin(db: float) -> float:
 def lin_to_db(lin: float) -> float:
     """linear (amplitude) → dB"""
     # small epsilon avoids log(0) on silent chunks
-    return 20.0 * math.log10(lin + 1e-12)
+    return 20.0 * np.log10(lin + 1e-12)
 
 
 # ───────────────────────────── DSP utilities ─────────────────────────────
@@ -70,16 +70,13 @@ def resample_to(
 # We prefer PyCryptodome for raw AES-ECB; fall back to cryptography if
 # PyCryptodome is not available.
 try:
-    from Cryptodome.Cipher import AES as _PCAES  # type: ignore
+    from Crypto.Cipher import AES as _PCAES  # type: ignore
+    # from Cryptodome.Cipher import AES as _PCAES
 except ModuleNotFoundError:  # pragma: no cover
     _PCAES = None
 
 if _PCAES is None:
-    from cryptography.hazmat.primitives.ciphers import (
-        Cipher,
-        algorithms,
-        modes,
-    )
+    from cryptography.hazmat.primitives.ciphers import Cipher,algorithms,modes
     from cryptography.hazmat.backends import default_backend
 
 

@@ -20,8 +20,9 @@ dependencies = [
   "scipy>=1.11",
   "sounddevice>=0.4",
   "soundfile>=0.12",
-  "cryptography>=42.0",        # XChaCha20
+  "cryptography>=42.0",        # XChaCha20 and AES
   "fastpolar>=0.3.1",          # fast SC & SCL dec
+  "tkinter; sys_platform == 'linux'",  # GUI support for Linux
 ]
 
 # ------------- optional / dev extras -------------------------------------
@@ -31,7 +32,9 @@ dev = [
   "black>=24.1",
   "flake8>=7.0",
   "mypy>=1.8",
-  "matplotlib>=3.8"
+  "matplotlib>=3.8",
+  "hypothesis>=6.0",           # Property-based testing
+  "nox>=2024.0",              # Test automation
 ]
 
 # ------------- console entry-points --------------------------------------
@@ -55,6 +58,23 @@ target-version = ["py312"]
 
 [tool.isort]
 profile = "black"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers"
+testpaths = [
+    "tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
 
 # -------------------------------------------------------------------------
 #  build backend

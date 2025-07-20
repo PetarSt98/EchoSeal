@@ -16,11 +16,6 @@ def _pc(N: int, K: int) -> PolarCode:
         _cache[key] = PolarCode(N, K, list_size=8, crc_size=8)
     return _cache[key]
 
-# def encode(payload: bytes, *, N=N_DEFAULT, K=K_DEFAULT) -> np.ndarray:
-#     if len(payload) * 8 != K:
-#         raise ValueError("payload size mismatch")
-#     return _pc(N, K).encode(np.unpackbits(np.frombuffer(payload, "u1")))
-
 def encode(payload: bytes, *, N=N_DEFAULT, K=K_DEFAULT) -> np.ndarray:
     """
     Encode a 55-byte payload (440 information bits) and append an 8-bit CRC.

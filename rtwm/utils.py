@@ -91,8 +91,7 @@ class StreamPRNG:
     """
 
     def __init__(self, master_key: bytes):
-        sub_key = hashlib.blake2s(master_key, digest_size=16, person=b"EchoSealPN").digest()
-
+        sub_key = hashlib.blake2s(master_key, digest_size=16, person=b"EchoSeal").digest()
         if _PCAES is not None:
             self._aes = _PCAES.new(sub_key, _PCAES.MODE_ECB)
 

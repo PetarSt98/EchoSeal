@@ -37,12 +37,13 @@ class WatermarkDetector:
         b, a = butter_bandpass(*band, self.fs_target)
         y    = lfilter(b, a, signal.astype(np.float32))
         y   /= np.max(np.abs(y)) + 1e-12
+        # y *= 20
 
         corr = correlate(y, 2*PREAMBLE - 1, mode="valid")
-        thresh = 8 * np.std(corr)
+        thresh = 3* np.std(corr)
         MAX_PEAKS = 200
         peaks = np.where(corr > thresh)[0][:MAX_PEAKS]
-
+        print(f"Band {band}: {len(peaks)} peaks detected, max corr: {np.max(corr) if len(corr) > 0 else 0}")
         wide_done = False
         for p in peaks:
             if p + FRAME_LEN > y.size:
@@ -64,20 +65,29 @@ class WatermarkDetector:
     def _try_window(self, frame: np.ndarray, ctr0: int, delta: int) -> bool:
         for ctr in range(max(0, ctr0 - delta), ctr0 + delta + 1):
             llr  = self._llr(frame, ctr)
+            print(f"[LLR] range = [{llr.min():.3f}, {llr.max():.3f}], mean={llr.mean():.3f}, std={llr.std():.3f}")
             blob = polar_dec(llr)
             if blob is None:
+                print(f"[RX] ctr={ctr}: polar decode failed")
                 continue
+            recovered_bits = np.unpackbits(np.frombuffer(blob, dtype="u1"))
+            print(f"[RX] bits: {recovered_bits[:16]}... len={len(recovered_bits)}")
+            print(f"[RX] ctr={ctr}, blob len={len(blob)}")
             try:
                 plain = self.sec.open(blob)
             except Exception:
+                print(f"[RX] ctr={ctr} — decrypt failed")
                 continue
 
+            print(f"[RX] trying ctr={ctr}, LLR mean={llr.mean():.3f}, std={llr.std():.3f}")
+
             if not plain.startswith(b"ESAL"):
+                print(f"[RX] ctr={ctr} — bad prefix: {plain[:4]}")
                 continue
 
             if int.from_bytes(plain[4:8], "big") != ctr:
+                print(f"[RX] Counter mismatch: plain={int.from_bytes(plain[4:8], 'big')} ≠ expected={ctr}")
                 continue                                 # counter mismatch
-
             nonce = plain[8:16]
             if self.session_nonce and nonce == self.session_nonce:
                 return True
@@ -90,13 +100,24 @@ class WatermarkDetector:
     def _llr(self, frame: np.ndarray, frame_id: int) -> np.ndarray:
         bits = self.sec.pn_bits(frame_id, FRAME_LEN)
         sig = (2 * bits - 1).astype(np.float32)
-        prod = frame * sig
-        noise = np.std(frame)
 
-        llr_raw = prod[len(PREAMBLE):] / (noise + 1e-12)
+        preamble_len = len(PREAMBLE)
+        chips = frame[preamble_len:]
+        ref = sig[preamble_len:]
 
-        # ✅ Soft decision scaling
-        gain = 4.0  # You can fine-tune this (3.0–5.0 works well)
-        llr = np.tanh(gain * llr_raw)
+        # Scale by chip energy, not full frame noise
+        signal_power = np.mean(ref ** 2)
+        noise_power = np.mean((chips - ref) ** 2)
+        snr_linear = signal_power / (noise_power + 1e-9)
 
+        # Basic LLR = 2 * symbol * chip / noise_std²
+        llr = 2 * chips * ref / (np.std(chips - ref) + 1e-9)
+
+        # Optionally clamp to avoid polar overconfidence
+        llr = np.clip(llr, -10.0, 10.0)
+
+        print(f"[LLR] ctr={frame_id}, noise std={np.std(chips - ref):.4f}, llr std={np.std(llr):.4f}")
         return llr
+
+
+

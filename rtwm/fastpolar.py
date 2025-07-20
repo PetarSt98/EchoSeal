@@ -52,28 +52,6 @@ class PolarCode:
     def decode(self, llr: np.ndarray):
         return self._sc_list_decode(llr)
 
-    # def _sc_list_decode(self, llr):
-    #     paths = [(0.0, np.zeros(self.N, dtype=np.uint8))]  # (path_metric, u_hat)
-    #     for i in range(self.N):
-    #         new_paths = []
-    #         for pm, u_hat in paths:
-    #             if self.frozen[i]:
-    #                 u_hat[i] = 0
-    #                 new_paths.append((pm + self._llr_metric(llr[i], 0), u_hat.copy()))
-    #             else:
-    #                 for bit in [0, 1]:
-    #                     u_hat[i] = bit
-    #                     metric = pm + self._llr_metric(llr[i], bit)
-    #                     new_paths.append((metric, u_hat.copy()))
-    #         paths = sorted(new_paths, key=lambda x: x[0])[:self.L]
-    #     for pm, u_hat in paths:
-    #         data = u_hat[~self.frozen]
-    #         info = data[:-self.crc_size]
-    #         crc  = data[-self.crc_size:]
-    #         if np.all(self._crc8(info) == crc):
-    #             return info, True
-    #     return np.zeros(self.K - self.crc_size, dtype=np.uint8), False
-
     def _sc_list_decode(self, llr):
         # hard decision: +LLR → 1, –LLR → 0
 

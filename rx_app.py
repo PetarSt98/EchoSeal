@@ -9,7 +9,7 @@ from rtwm.detector import WatermarkDetector
 def parse_args():
     p = argparse.ArgumentParser(description="Verify watermark")
     p.add_argument("--key", required=True, help="256-bit hex key (64 hex chars) or path to keyfile")
-    p.add_argument("audio", help="audio file to check")
+    p.add_argument("--audio", help="audio file to check")
     return p.parse_args()
 
 def load_key(path_or_hex: str) -> bytes:

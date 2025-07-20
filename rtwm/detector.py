@@ -40,7 +40,8 @@ class WatermarkDetector:
 
         corr = correlate(y, 2*PREAMBLE - 1, mode="valid")
         thresh = 8 * np.std(corr)
-        peaks  = np.where(corr > thresh)[0]
+        MAX_PEAKS = 200
+        peaks = np.where(corr > thresh)[0][:MAX_PEAKS]
 
         wide_done = False
         for p in peaks:
@@ -78,16 +79,24 @@ class WatermarkDetector:
                 continue                                 # counter mismatch
 
             nonce = plain[8:16]
-            if self.session_nonce is None:
-                self.session_nonce = nonce              # establish session
-            if nonce == self.session_nonce:
-                return True                             # authentic frame
+            if self.session_nonce and nonce == self.session_nonce:
+                return True
+            elif self.session_nonce is None:
+                self.session_nonce = nonce
+                return True                          # authentic frame
         return False
 
     # ------------------------------------------------------------------ helpers
     def _llr(self, frame: np.ndarray, frame_id: int) -> np.ndarray:
         bits = self.sec.pn_bits(frame_id, FRAME_LEN)
-        sig  = (2*bits - 1).astype(np.float32)
+        sig = (2 * bits - 1).astype(np.float32)
         prod = frame * sig
         noise = np.std(frame)
-        return prod[len(PREAMBLE):] / (noise + 1e-12)
+
+        llr_raw = prod[len(PREAMBLE):] / (noise + 1e-12)
+
+        # ✅ Soft decision scaling
+        gain = 4.0  # You can fine-tune this (3.0–5.0 works well)
+        llr = np.tanh(gain * llr_raw)
+
+        return llr

@@ -2,13 +2,13 @@
 Real-time frequency-hopping ultrasonic watermark transmitter.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np, secrets
 from scipy.signal import lfilter
 
-from .utils       import choose_band, butter_bandpass, db_to_lin
-from .crypto      import SecureChannel
-from .polar_fast  import encode as polar_enc, N_DEFAULT, K_DEFAULT
+from rtwm.utils       import choose_band, butter_bandpass, db_to_lin
+from rtwm.crypto      import SecureChannel
+from rtwm.polar_fast  import encode as polar_enc, N_DEFAULT, K_DEFAULT
 
 @dataclass(slots=True)
 class TxParams:
@@ -16,7 +16,7 @@ class TxParams:
     target_rel_db: float = -20.0
     N: int = N_DEFAULT
     K: int = K_DEFAULT
-    preamble: np.ndarray = np.array([1, 0, 1] * 21)[:63]   # 63-chip MLS
+    preamble: np.ndarray = field(default_factory=lambda: np.array([1, 0, 1] * 21, dtype=np.uint8)[:63])
 
 class WatermarkEmbedder:
     def __init__(self, key32: bytes, params: TxParams | None = None) -> None:
@@ -57,7 +57,35 @@ class WatermarkEmbedder:
         self.frame_ctr += 1
         return chips.astype(np.float32)
 
+    # def _build_payload(self) -> bytes:
+    #     meta  = b"ESAL" + self.frame_ctr.to_bytes(4, "big") + secrets.token_bytes(32)
+    #     blob  = self.sec.seal(meta)                     # 56 B fits K=448 bits
+    #     return blob[:56]                                   # no trunc / pad
+
     def _build_payload(self) -> bytes:
-        meta  = b"ESAL" + self.frame_ctr.to_bytes(4, "big") + secrets.token_bytes(8)
-        blob  = self.sec.seal(meta)                     # 56 B fits K=448 bits
-        return blob                                     # no trunc / pad
+        """
+        Build the 27-byte plaintext, seal it with XChaCha20-Poly1305 and
+        return the resulting 55-byte ciphertext ‖ tag ‖ nonce.
+
+        Layout on the wire (55 bytes):
+            0‥11   : 12-byte XChaCha nonce
+           12‥27   : 16-byte Poly1305 tag
+           28‥54   : 27-byte ciphertext
+        """
+
+        PLAINTEXT_LEN = 27  # 55-(12+16)
+        rnd_len = PLAINTEXT_LEN - 8  # leave 8 bytes for nonce
+
+        meta = (
+            b"ESAL"
+            + self.frame_ctr.to_bytes(4, "big")  # counter
+            + secrets.token_bytes(rnd_len)  # session nonce + padding
+        )
+
+        assert len(meta) == PLAINTEXT_LEN
+
+        blob = self.sec.seal(meta)  # 12+16+27 = 55 bytes
+
+        assert len(blob) == 55
+
+        return blob

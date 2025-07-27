@@ -2,9 +2,12 @@
 Minimal standalone Polar Code implementation with CRC and SC-List decoding.
 Inspired by Arikan's original construction. For use in real-time audio watermarking.
 """
-
+import os
 import numpy as np
 from itertools import combinations
+
+from rtwm.reliability_polar_bits import Q_Nmax
+
 
 class PolarCode:
     def __init__(self, N: int, K: int, list_size: int = 1, crc_size: int = 8):
@@ -15,13 +18,22 @@ class PolarCode:
         self.crc_size = crc_size
         self.frozen = self._select_frozen_bits(N, K)
         self.crc_poly = 0x107  # CRC-8 poly (x^8 + x^2 + x + 1)
+        print(f"[POLAR INIT] Frozen bits: {np.where(self.frozen)[0][:10]}...")
+        print(f"[POLAR INIT] frozen sum: {np.sum(self.frozen)}, frozen[:10]: {np.where(self.frozen)[0][:10]}")
 
     def _select_frozen_bits(self, N, K):
-        reliability = sorted(range(N), key=lambda x: bin(x).count("1"))
-        frozen = np.ones(N, dtype=bool)
-        for i in reliability[-K:]:
-            frozen[i] = False
-        return frozen
+        reliability = np.array(list(map(int, Q_Nmax.split())))  # 1024 elements
+        assert len(reliability) == N, f"Q_Nmax must have {N} entries"
+
+        frozen_mask = np.ones(N, dtype=bool)  # everything frozen by default
+        frozen_mask[reliability[:K]] = False  # unfreeze the K most reliable bits
+        return frozen_mask
+    # def _select_frozen_bits(self, N, K):
+    #     reliability = sorted(range(N), key=lambda x: bin(x).count("1"))
+    #     frozen = np.ones(N, dtype=bool)
+    #     for i in reliability[-K:]:
+    #         frozen[i] = False
+    #     return frozen
 
     def _crc8(self, bits):
         poly = np.uint8(self.crc_poly & 0xFF)
@@ -63,7 +75,8 @@ class PolarCode:
         info, crc = data[:-self.crc_size], data[-self.crc_size:]
 
         ok = bool(np.all(self._crc8(info) == crc))
-
+        if not ok:
+            print("[POLAR] CRC check failed.")
         return info, ok
 
     def _llr_metric(self, llr, bit):
@@ -80,6 +93,5 @@ class PolarCode:
                     a = x[i + j]
                     b = x[i + j + step // 2]
                     x[i + j] = a ^ b
-                    # This line was missing
                     x[i + j + step // 2] = b
         return x

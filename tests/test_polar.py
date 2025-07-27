@@ -31,3 +31,26 @@ def test_crc8():
     assert np.all(pc._crc8(bits) == crc)
     assert len(crc) == 8
 
+
+def test_polar_with_noise():
+    pc = PolarCode(N_DEFAULT, K_DEFAULT, list_size=8, crc_size=8)
+    bits = np.random.randint(0, 2, K_DEFAULT - 8, dtype=np.uint8)
+    enc = pc.encode(bits)
+
+    # Add some noise
+    snr_db = 10  # Start with good SNR
+    signal_power = 1.0
+    noise_power = signal_power / (10 ** (snr_db / 10))
+
+    # Convert to BPSK and add noise
+    bpsk = 2 * enc.astype(float) - 1
+    noisy = bpsk + np.random.normal(0, np.sqrt(noise_power), len(bpsk))
+
+    # Calculate LLR
+    llr = 2 * noisy / noise_power
+
+    dec_bits, ok = pc.decode(llr)
+    print(f"SNR: {snr_db}dB, Decode success: {ok}")
+    if ok:
+        print(f"BER: {np.mean(bits != dec_bits[:len(bits)]):.6f}")
+

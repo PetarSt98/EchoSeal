@@ -24,6 +24,7 @@ class WatermarkEmbedder:
         self.sec = SecureChannel(key32)
         self.frame_ctr = 0
         self._chip_buf: np.ndarray | None = None
+        print("Embedder band frame 0:", choose_band(self.sec.master_key, 0))
 
 
     # ------------------------------------------------------------------ API
@@ -49,15 +50,24 @@ class WatermarkEmbedder:
         """Generate the watermark chips for one full frame."""
         band = choose_band(self.sec.master_key, self.frame_ctr)
         b, a = butter_bandpass(*band, self.p.fs)
+
         payload = self._build_payload()  # 56-byte encrypted payload
         payload_bits = np.unpackbits(np.frombuffer(payload, dtype="u1"))
         print(f"[TX] bits: {payload_bits[:16]}... len={len(payload_bits)}")
-        bits = np.concatenate((self.p.preamble,
-                               polar_enc(payload, N=self.p.N, K=self.p.K)))
-        pn = self.sec.pn_bits(self.frame_ctr, bits.size)
-        symbols = (2 * bits - 1) * (2 * pn - 1)  # BPSK modulated and spread
+
+        data_bits = polar_enc(payload, N=self.p.N, K=self.p.K)  # 1024
+        frame_len = len(self.p.preamble) + data_bits.size  # 1087
+
+        pn_full = self.sec.pn_bits(self.frame_ctr, frame_len)  # 1087 bits
+        pn_payload = pn_full[len(self.p.preamble):]  # last 1024 bits
+
+        # Correct mapping:
+        preamble_sy = 2 * self.p.preamble - 1  # plain [+1 -1 +1...]
+        payload_sy = (2 * data_bits - 1) * (2 * pn_payload - 1)  # spread
+        symbols = np.concatenate((preamble_sy, payload_sy))
+
         chips = lfilter(b, a, symbols.astype(np.float32))
-        chips /= np.sqrt(np.mean(chips**2)) + 1e-12  # normalize energy
+        chips /= np.sqrt(np.mean(chips ** 2)) + 1e-12
         print(f"[TX] frame {self.frame_ctr}, chip len = {len(chips)}")
         self.frame_ctr += 1
         return chips.astype(np.float32)

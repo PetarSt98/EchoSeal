@@ -1,115 +1,220 @@
 import numpy as np
+from scipy.signal import lfilter, filtfilt, correlate
+from scipy.fft import fft, fftfreq
+
 from rtwm.embedder import WatermarkEmbedder
-from rtwm.detector import WatermarkDetector
+from rtwm.detector import WatermarkDetector, PREAMBLE
 from rtwm.crypto import SecureChannel
-from rtwm.utils import choose_band
+from rtwm.utils import choose_band, butter_bandpass
 from rtwm.polar_fast import encode as polar_enc
 
 
-def debug_tx_rx_mismatch(key=b"\xAA" * 32):
+def deep_debug_analysis(key=b"\xAA" * 32):
     """
-    Compare what TX sends vs what RX expects to receive.
-    This will help identify the exact mismatch.
+    Deep debugging to find exact mismatch between TX and RX.
     """
+    print("=" * 80)
+    print("DEEP DEBUG: TX/RX MISMATCH ANALYSIS")
+    print("=" * 80)
 
-    print("=" * 60)
-    print("TX/RX SIGNAL COMPARISON DEBUG")
-    print("=" * 60)
-
-    # Create TX and RX
+    # Create instances
     tx = WatermarkEmbedder(key)
     rx = WatermarkDetector(key)
     sec = SecureChannel(key)
 
-    # Generate one frame from TX
+    # Parameters
     frame_ctr = 0
+    band = choose_band(key, frame_ctr)
+    b, a = butter_bandpass(*band, tx.p.fs)
 
-    # Step 1: Get the same payload that TX would generate
-    tx.frame_ctr = frame_ctr  # Set to known value
+    print(f"Band: {band}, Filter order: {len(b) - 1}")
+
+    # Step 1: Generate TX frame components separately
+    print("\n1. TX FRAME GENERATION (Step by Step)")
+    print("-" * 40)
+
+    # Build payload
+    tx.frame_ctr = frame_ctr
     payload_bytes = tx._build_payload()
-
-    print(f"1. Payload: {len(payload_bytes)} bytes")
-    print(f"   First 8 bytes: {payload_bytes[:8].hex()}")
-
-    # Step 2: Encode with polar codes (same as TX)
-    payload_bits = np.unpackbits(np.frombuffer(payload_bytes, dtype="u1"))
-    print(f"2. Payload bits: {len(payload_bits)} bits")
-    print(f"   First 16 bits: {payload_bits[:16]}")
-
     data_bits = polar_enc(payload_bytes, N=1024, K=448)
-    print(f"3. Polar encoded: {len(data_bits)} bits")
-    print(f"   First 16 bits: {data_bits[:16]}")
 
-    # Step 3: Get PN sequence (same as TX)
-    frame_len = 63 + len(data_bits)  # preamble + data
+    # Generate PN sequence
+    frame_len = 63 + 1024
     pn_full = sec.pn_bits(frame_ctr, frame_len)
-    pn_payload = pn_full[63:]  # Skip preamble part
+    pn_preamble = pn_full[:63]
+    pn_payload = pn_full[63:]
 
-    print(f"4. PN sequence: {len(pn_full)} bits total, {len(pn_payload)} for payload")
-    print(f"   PN payload first 16: {pn_payload[:16]}")
+    # Create symbols BEFORE filtering
+    preamble_symbols = 2.0 * PREAMBLE.astype(np.float32) - 1.0
+    data_symbols = 2.0 * data_bits.astype(np.float32) - 1.0
+    pn_symbols = 2.0 * pn_payload.astype(np.float32) - 1.0
 
-    # Step 4: Check TX spreading operation
-    preamble_sy = 2 * np.array([1, 0, 1] * 21, dtype=np.uint8)[:63] - 1
-    payload_sy_tx = (2 * data_bits - 1) * (2 * pn_payload - 1)  # TX spreading
+    # Spread payload
+    spread_payload = data_symbols * pn_symbols
 
-    print(f"5. TX spreading:")
-    print(f"   Data symbols: {(2 * data_bits - 1)[:8]} (first 8)")
-    print(f"   PN symbols: {(2 * pn_payload - 1)[:8]} (first 8)")
-    print(f"   Spread result: {payload_sy_tx[:8]} (first 8)")
+    # Concatenate (before filtering)
+    symbols_unfiltered = np.concatenate((preamble_symbols, spread_payload))
 
-    # Step 5: What RX should do for despreading
-    print(f"6. RX despreading check:")
-    print(f"   To recover data: spread_signal * pn_symbols")
-    recovered = payload_sy_tx * (2 * pn_payload - 1)
-    print(f"   Recovered: {recovered[:8]} (first 8)")
-    print(f"   Original data: {(2 * data_bits - 1)[:8]} (first 8)")
-    print(f"   Match? {np.allclose(recovered, (2 * data_bits - 1))}")
+    print(f"Preamble symbols: mean={np.mean(preamble_symbols):.3f}, std={np.std(preamble_symbols):.3f}")
+    print(f"Spread payload: mean={np.mean(spread_payload):.3f}, std={np.std(spread_payload):.3f}")
+    print(f"Combined symbols: len={len(symbols_unfiltered)}")
 
-    # Step 6: Generate actual TX signal
-    tx_chips = tx._make_frame_chips()
-    print(f"7. TX chips: {len(tx_chips)} samples")
-    print(f"   Energy: {np.mean(tx_chips ** 2):.6f}")
-    print(f"   Mean: {np.mean(tx_chips):.6f}")
-    print(f"   Std: {np.std(tx_chips):.6f}")
+    # Step 2: Apply filtering (as TX does)
+    print("\n2. FILTERING ANALYSIS")
+    print("-" * 40)
 
-    # Step 7: Check what happens when RX processes this
-    print(f"8. RX processing simulation:")
+    # Filter the complete symbol sequence
+    chips_filtered = lfilter(b, a, symbols_unfiltered)
 
-    # Extract payload from TX signal (after bandpass filtering effects)
-    payload_part = tx_chips[63:]  # Skip preamble
-    print(f"   RX payload chips: mean={np.mean(payload_part):.6f}, std={np.std(payload_part):.6f}")
+    # Normalize to unit energy (as TX does)
+    energy = np.mean(chips_filtered ** 2)
+    if energy > 1e-12:
+        chips_filtered /= np.sqrt(energy)
 
-    # Normalize (as RX does)
-    payload_normalized = payload_part / (np.sqrt(np.mean(payload_part ** 2)) + 1e-12)
-    print(f"   After normalization: mean={np.mean(payload_normalized):.6f}, std={np.std(payload_normalized):.6f}")
+    print(f"Filtered chips: mean={np.mean(chips_filtered):.6f}, std={np.std(chips_filtered):.3f}")
+    print(f"Energy after normalization: {np.mean(chips_filtered ** 2):.3f}")
+
+    # Step 3: Compare with actual TX output
+    print("\n3. COMPARISON WITH ACTUAL TX OUTPUT")
+    print("-" * 40)
+
+    tx.frame_ctr = frame_ctr  # Reset counter
+    tx_chips_actual = tx._make_frame_chips()
+
+    chips_match = np.allclose(chips_filtered, tx_chips_actual, rtol=1e-5)
+    print(f"Our reconstruction matches TX output: {chips_match}")
+    if not chips_match:
+        max_diff = np.max(np.abs(chips_filtered - tx_chips_actual))
+        print(f"Max difference: {max_diff}")
+
+    # Step 4: Analyze preamble correlation issue
+    print("\n4. PREAMBLE CORRELATION ANALYSIS")
+    print("-" * 40)
+
+    # Extract preamble from filtered signal
+    preamble_in_signal = chips_filtered[:63]
+
+    # Create different preamble templates
+    template_unfiltered = preamble_symbols
+    template_filtered = lfilter(b, a, preamble_symbols)
+    template_filtered_norm = template_filtered / np.sqrt(np.mean(template_filtered ** 2))
+
+    # Check correlations
+    corr1 = np.dot(preamble_in_signal, template_unfiltered) / (
+        np.sqrt(np.sum(preamble_in_signal ** 2) * np.sum(template_unfiltered ** 2))
+    )
+    corr2 = np.dot(preamble_in_signal, template_filtered) / (
+        np.sqrt(np.sum(preamble_in_signal ** 2) * np.sum(template_filtered ** 2))
+    )
+    corr3 = np.dot(preamble_in_signal, template_filtered_norm) / (
+        np.sqrt(np.sum(preamble_in_signal ** 2) * np.sum(template_filtered_norm ** 2))
+    )
+
+    print(f"Correlation with unfiltered template: {corr1:.3f}")
+    print(f"Correlation with filtered template: {corr2:.3f}")
+    print(f"Correlation with filtered+normalized template: {corr3:.3f}")
+
+    # Step 5: Test despreading on properly aligned frame
+    print("\n5. DESPREADING TEST (Properly Aligned)")
+    print("-" * 40)
+
+    # Extract payload from filtered signal
+    payload_in_signal = chips_filtered[63:63 + 1024]
 
     # Despread
-    despread = payload_normalized * (2 * pn_payload - 1)
-    print(f"   After despreading: mean={np.mean(despread):.6f}, std={np.std(despread):.6f}")
-    print(f"   Range: [{despread.min():.6f}, {despread.max():.6f}]")
+    despread = payload_in_signal * pn_symbols
 
-    # Check if despread signal correlates with original data
-    data_symbols = (2 * data_bits - 1).astype(np.float32)
-    correlation = np.corrcoef(despread, data_symbols)[0, 1]
-    print(f"   Correlation with original data: {correlation:.6f}")
+    # Check bit errors
+    detected_bits = (despread > 0).astype(int)
+    original_bits = (data_bits > 0).astype(int)
+    bit_errors = np.sum(detected_bits != original_bits)
+    ber = bit_errors / len(data_bits)
 
-    if abs(correlation) < 0.1:
-        print("   ⚠️  WARNING: Very low correlation suggests signal processing mismatch!")
-    elif correlation > 0.8:
-        print("   ✅ Good correlation - signal processing looks correct")
+    print(f"Despread stats: mean={np.mean(despread):.3f}, std={np.std(despread):.3f}")
+    print(f"Bit errors: {bit_errors}/{len(data_bits)} (BER: {ber:.3f})")
+
+    # Correlation
+    corr_despread = np.corrcoef(despread, data_symbols)[0, 1]
+    print(f"Correlation between despread and original: {corr_despread:.3f}")
+
+    # Step 6: Frame search simulation
+    print("\n6. FRAME SEARCH SIMULATION")
+    print("-" * 40)
+
+    # Simulate what detector does
+    # Use the properly filtered template
+    template_for_search = lfilter(b, a, preamble_symbols)
+
+    # Try correlation at different positions
+    print("Correlation at different offsets:")
+    for offset in [0, 1, 2, 3, 4, 5, 10, 20, 50]:
+        if offset + 63 <= len(chips_filtered):
+            segment = chips_filtered[offset:offset + 63]
+            seg_energy = np.sum(segment ** 2)
+            temp_energy = np.sum(template_for_search ** 2)
+            if seg_energy > 1e-12 and temp_energy > 1e-12:
+                corr = np.dot(segment, template_for_search) / np.sqrt(seg_energy * temp_energy)
+                print(f"  Offset {offset}: {corr:.3f}")
+
+    # Step 7: Check if the issue is with the entire frame pipeline
+    print("\n7. FULL DETECTION PIPELINE TEST")
+    print("-" * 40)
+
+    # Test with our reconstructed signal
+    class DebugDetector(WatermarkDetector):
+        def test_frame_direct(self, frame, frame_id):
+            """Bypass all detection logic and test LLR directly."""
+            return self._llr(frame, frame_id)
+
+    debug_rx = DebugDetector(key)
+    llr = debug_rx.test_frame_direct(chips_filtered, frame_ctr)
+
+    print(f"LLR stats: mean={np.mean(llr):.3f}, std={np.std(llr):.3f}")
+    print(f"LLR range: [{np.min(llr):.3f}, {np.max(llr):.3f}]")
+
+    # Check if we can decode
+    from rtwm.polar_fast import decode as polar_dec
+    blob = polar_dec(llr)
+    if blob is not None:
+        try:
+            plain = sec.open(blob)
+            print(f"✅ Decoding successful! Payload starts with: {plain[:8].hex()}")
+        except Exception as e:
+            print(f"❌ Decrypt failed: {type(e).__name__}")
     else:
-        print("   ⚠️  Moderate correlation - there might be some issues")
+        print("❌ Polar decode failed")
+
+    # Step 8: The smoking gun - check the actual TX implementation
+    print("\n8. TX IMPLEMENTATION CHECK")
+    print("-" * 40)
+
+    # Let's trace through TX's actual frame generation
+    tx.frame_ctr = frame_ctr
+    tx._chip_buf = np.empty(0, dtype=np.float32)  # Reset buffer
+
+    # Process with empty input to force frame generation
+    dummy_input = np.zeros(2048)
+    output = tx.process(dummy_input)
+
+    # The chips should be in the buffer
+    generated_chips = output - dummy_input  # Extract just the watermark
+    alpha = 10 ** (tx.p.target_rel_db / 20.0)  # Convert dB to linear
+    generated_chips = generated_chips / alpha  # Undo scaling
+
+    print(
+        f"TX process() output stats: mean={np.mean(generated_chips[:1087]):.6f}, std={np.std(generated_chips[:1087]):.3f}")
 
     return {
-        'tx_chips': tx_chips,
-        'payload_bits': payload_bits,
-        'data_bits': data_bits,
-        'pn_payload': pn_payload,
+        'chips_filtered': chips_filtered,
+        'tx_chips_actual': tx_chips_actual,
+        'data_symbols': data_symbols,
+        'pn_symbols': pn_symbols,
         'despread': despread,
-        'correlation': correlation
+        'llr': llr,
+        'bit_errors': bit_errors,
+        'correlation': corr_despread
     }
 
 
-# Usage:
 if __name__ == "__main__":
-    results = debug_tx_rx_mismatch()
+    results = deep_debug_analysis()

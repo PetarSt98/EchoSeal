@@ -1,14 +1,13 @@
 """
-Offline detector – sync, soft LLR, SCL-list polar, adaptive threshold.
-FIXED VERSION with proper signal processing that matches TX exactly.
+Fixed watermark detector with proper preamble template generation.
 """
 from __future__ import annotations
 import numpy as np
 from scipy.signal import lfilter, correlate
 
-from .utils       import BAND_PLAN, butter_bandpass, resample_to, choose_band
-from .crypto      import SecureChannel
-from .polar_fast  import decode as polar_dec, N_DEFAULT
+from rtwm.utils       import BAND_PLAN, butter_bandpass, resample_to, choose_band
+from rtwm.crypto      import SecureChannel
+from rtwm.polar_fast  import decode as polar_dec, N_DEFAULT
 
 PREAMBLE      = np.array([1, 0, 1] * 21, dtype=np.uint8)[:63]
 FRAME_LEN     = len(PREAMBLE) + N_DEFAULT          # 1087 chips
@@ -36,216 +35,228 @@ class WatermarkDetector:
 
     # ------------------------------------------------------------------ band scan
     def verify_raw_frame(self, signal: np.ndarray) -> bool:
-        """Bypass filtering when testing synthetic chip frames."""
+        """Test a raw frame directly (for debugging)."""
+        # For raw frames that are already filtered and normalized,
+        # we should test them directly without additional filtering
+        print(f"[RAW FRAME TEST] Testing frame of length {len(signal)}")
+
+        if len(signal) == FRAME_LEN:
+            # This is a complete frame - try to decode it directly
+            for ctr in range(4):  # Try a few frame counters
+                llr = self._llr(signal, ctr)
+
+                # Quality check
+                llr_std = np.std(llr)
+                print(f"[RAW TEST] ctr={ctr}: LLR std={llr_std:.3f}")
+
+                if llr_std < 0.3:
+                    continue
+
+                blob = polar_dec(llr)
+                if blob is None:
+                    continue
+
+                try:
+                    plain = self.sec.open(blob)
+                    if plain.startswith(b"ESAL"):
+                        embedded_ctr = int.from_bytes(plain[4:8], "big")
+                        if embedded_ctr == ctr:
+                            print(f"[SUCCESS] Raw frame decoded with ctr={ctr}")
+                            return True
+                except:
+                    continue
+
+        # If direct testing fails, we might have an unfiltered frame
+        # Try the band scanning approach
         band = choose_band(self.sec.master_key, 0)
-        return self._scan_band(signal, band, skip_filtering=True)
+        return self._scan_band(signal, band, skip_filtering=False)
 
     def _scan_band(self, signal: np.ndarray, band, skip_filtering=False) -> bool:
-        """Enhanced band scanning with better debugging."""
-        if skip_filtering:
-            y = signal.astype(np.float32)
-            tpl = (2 * PREAMBLE - 1).astype(np.float32)
-        else:
-            b, a = butter_bandpass(*band, self.fs_target)
-            y = lfilter(b, a, signal.astype(np.float32))
-            tpl = lfilter(b, a, (2 * PREAMBLE - 1).astype(np.float32))
+        """Scan for watermark frames in the given frequency band."""
+        print(f"[SCAN-BAND] Band {band}, signal_len={len(signal)}")
 
-        tpl /= np.sqrt(np.mean(tpl ** 2)) + 1e-12  # normalize energy
-        corr = correlate(y, tpl, mode="valid")
+        # Apply bandpass filter to signal
+        b, a = butter_bandpass(*band, self.fs_target)
+        y = lfilter(b, a, signal.astype(np.float32))
 
-        PEAK_SHIFT = (len(PREAMBLE) - 1) // 2
-        thresh = 3 * np.std(corr)
-        MAX_PEAKS = 200
-        peaks = np.where(corr > thresh)[0][:MAX_PEAKS]
+        # CRITICAL: Create preamble template the SAME way as TX
+        # The TX applies the filter to the ENTIRE frame (preamble + payload)
+        # So we need to create a template that matches what the filtered preamble looks like
 
-        print(f"Band {band}: {len(peaks)} peaks detected, max corr: {np.max(corr) if len(corr) > 0 else 0}")
-        print(f"[DEBUG] Correlation stats: mean={np.mean(corr):.3f}, std={np.std(corr):.3f}, thresh={thresh:.3f}")
+        # First, create a dummy frame to extract just the preamble part
+        preamble_symbols = 2.0 * PREAMBLE.astype(np.float32) - 1.0
 
-        # Also try the strongest peaks regardless of threshold
+        # Create a full dummy frame (preamble + zeros for payload)
+        dummy_frame = np.zeros(FRAME_LEN, dtype=np.float32)
+        dummy_frame[:len(PREAMBLE)] = preamble_symbols
+
+        # Filter the entire dummy frame (same as TX does)
+        dummy_filtered = lfilter(b, a, dummy_frame)
+
+        # Extract just the preamble part after filtering
+        preamble_template = dummy_filtered[:len(PREAMBLE)].copy()
+
+        # Normalize the template (TX normalizes the whole frame, but we only care about preamble correlation)
+        template_energy = np.sum(preamble_template**2)
+        if template_energy > 1e-12:
+            preamble_template /= np.sqrt(template_energy)
+
+        print(f"[SCAN-BAND] Preamble template: mean={np.mean(preamble_template):.6f}, std={np.std(preamble_template):.3f}")
+
+        # Now search for this template in the signal
+        # Use 'valid' mode to avoid edge effects
+        if len(y) < len(preamble_template):
+            print(f"[SCAN-BAND] Signal too short for correlation")
+            return False
+
+        corr = correlate(y, preamble_template, mode='valid')
+
+        # Normalize correlation by local signal energy
+        corr_normalized = np.zeros_like(corr)
+        for i in range(len(corr)):
+            segment = y[i:i+len(preamble_template)]
+            seg_energy = np.sum(segment**2)
+            temp_energy = np.sum(preamble_template**2)
+
+            if seg_energy > 1e-12 and temp_energy > 1e-12:
+                corr_normalized[i] = corr[i] / np.sqrt(seg_energy * temp_energy)
+
+        # Find peaks
+        threshold = 0.5  # Correlation threshold
+        peaks = np.where(np.abs(corr_normalized) > threshold)[0]
+
+        print(f"[SCAN-BAND] Found {len(peaks)} peaks above threshold {threshold}")
+
         if len(peaks) == 0:
-            # Find top 10 peaks even if below threshold
-            peak_indices = np.argsort(corr)[-10:]
-            peaks = peak_indices[corr[peak_indices] > 0]
-            print(f"[DEBUG] No peaks above threshold, trying top {len(peaks)} peaks")
+            # Lower threshold and try again
+            threshold = 0.3
+            peaks = np.where(np.abs(corr_normalized) > threshold)[0]
+            print(f"[SCAN-BAND] With lower threshold {threshold}: {len(peaks)} peaks")
 
-        wide_done = False
-        for i, p in enumerate(peaks):
-            if p + FRAME_LEN > y.size:
+        # Try each peak
+        for peak_idx in peaks[:20]:  # Try up to 20 peaks
+            frame_start = peak_idx  # In 'valid' mode, this is the actual start position
+
+            if frame_start + FRAME_LEN > len(y):
                 continue
 
-            print(f"[DEBUG] Testing peak {i+1}/{len(peaks)} at position {p}, corr={corr[p]:.3f}")
+            frame = y[frame_start:frame_start+FRAME_LEN]
 
-            start = p - PEAK_SHIFT
-            if start < 0:
-                print(f"[DEBUG] Peak too close to start: p={p}, PEAK_SHIFT={PEAK_SHIFT}")
-                continue
+            # Estimate frame counter
+            est_ctr = frame_start // FRAME_LEN
 
-            if start + FRAME_LEN > y.size:
-                print(f"[DEBUG] Peak too close to end: start={start}, FRAME_LEN={FRAME_LEN}, y.size={y.size}")
-                continue
-
-            frame = y[start: start + FRAME_LEN]
-            est_ctr = start // FRAME_LEN
-
-            print(f"[DEBUG] Frame extracted: len={len(frame)}, est_ctr={est_ctr}")
-
-            # 1) fast ±3 window
+            # Try decoding
             if self._try_window(frame, est_ctr, TIGHT_DELTA):
+                print(f"[SUCCESS] Frame found at position {frame_start}")
                 return True
-
-            # 2) one-time wider fallback
-            if not wide_done and self._try_window(frame, est_ctr, WIDE_DELTA):
-                return True
-            wide_done = True
-
-            # Stop after testing first few strong peaks to avoid excessive computation
-            if i >= 5:
-                print("[DEBUG] Tested first 5 peaks, moving on")
-                break
 
         return False
 
     # ------------------------------------------------------------------ window search
     def _try_window(self, frame: np.ndarray, ctr0: int, delta: int) -> bool:
+        """Try different frame counter values within window."""
         for ctr in range(max(0, ctr0 - delta), ctr0 + delta + 1):
             llr = self._llr(frame, ctr)
-            print(f"[LLR] range = [{llr.min():.3f}, {llr.max():.3f}], mean={llr.mean():.3f}, std={llr.std():.3f}")
+
+            # Quality check
+            llr_std = np.std(llr)
+            if llr_std < 0.3:
+                print(f"[RX] ctr={ctr}: LLR variance too low ({llr_std:.3f}), skipping")
+                continue
+
+            print(f"[LLR] ctr={ctr}: range=[{llr.min():.3f}, {llr.max():.3f}], std={llr_std:.3f}")
+
             blob = polar_dec(llr)
             if blob is None:
                 print(f"[RX] ctr={ctr}: polar decode failed")
                 continue
-            recovered_bits = np.unpackbits(np.frombuffer(blob, dtype="u1"))
-            print(f"[RX] bits: {recovered_bits[:16]}... len={len(recovered_bits)}")
-            print(f"[RX] ctr={ctr}, blob len={len(blob)}")
+
             try:
                 plain = self.sec.open(blob)
-            except Exception:
-                print(f"[RX] ctr={ctr} — decrypt failed")
+                print(f"[RX] ctr={ctr}: decrypt success, checking payload")
+            except Exception as e:
+                print(f"[RX] ctr={ctr}: decrypt failed ({type(e).__name__})")
                 continue
-
-            print(f"[RX] trying ctr={ctr}, LLR mean={llr.mean():.3f}, std={llr.std():.3f}")
 
             if not plain.startswith(b"ESAL"):
-                print(f"[RX] ctr={ctr} — bad prefix: {plain[:4]}")
+                print(f"[RX] ctr={ctr}: bad prefix: {plain[:4]}")
                 continue
 
-            if int.from_bytes(plain[4:8], "big") != ctr:
-                print(f"[RX] Counter mismatch: plain={int.from_bytes(plain[4:8], 'big')} ≠ expected={ctr}")
-                continue                                 # counter mismatch
+            embedded_ctr = int.from_bytes(plain[4:8], "big")
+            if embedded_ctr != ctr:
+                print(f"[RX] ctr={ctr}: counter mismatch (embedded={embedded_ctr})")
+                continue
+
             nonce = plain[8:16]
             if self.session_nonce and nonce == self.session_nonce:
+                print(f"[SUCCESS] ctr={ctr}: watermark verified (repeat nonce)")
                 return True
             elif self.session_nonce is None:
                 self.session_nonce = nonce
-                return True                          # authentic frame
+                print(f"[SUCCESS] ctr={ctr}: watermark verified (new nonce)")
+                return True
+
         return False
 
     # ------------------------------------------------------------------ helpers
     def _llr(self, frame: np.ndarray, frame_id: int) -> np.ndarray:
         """
-        CORRECTLY FIXED LLR calculation for multiplication-based spreading with proper scaling.
+        Calculate log-likelihood ratios for polar decoder.
 
-        TX does:
-        1. Map data bits to symbols: data_symbols = (2*data_bits - 1)
-        2. Map PN bits to symbols: pn_symbols = (2*pn_bits - 1)
-        3. Multiply: spread_symbols = data_symbols * pn_symbols
-        4. Apply bandpass filter (reduces amplitude!)
-
-        RX must:
-        1. Get received symbols (after filtering, amplitude reduced)
-        2. Despread: despread_symbols = received_symbols * pn_symbols
-        3. Scale and calculate LLR with proper amplitude compensation
+        The frame should already be filtered and aligned, starting with preamble.
         """
-
         # Get PN sequence for this frame
         pn_full = self.sec.pn_bits(frame_id, FRAME_LEN)
         pn_payload = pn_full[len(PREAMBLE):]
 
-        # Extract payload from received frame
+        # Extract payload part
         payload_received = frame[len(PREAMBLE):].copy()
 
-        print(f"[DEBUG] Frame {frame_id}: processing {len(payload_received)} payload samples")
-
-        # Ensure we don't exceed array bounds
+        # Ensure consistent lengths
         min_len = min(len(payload_received), len(pn_payload))
         payload_received = payload_received[:min_len]
         pn_payload = pn_payload[:min_len]
 
-        # Convert PN bits to symbols: {0,1} → {-1,+1}
-        pn_symbols = 2 * pn_payload.astype(np.float32) - 1
+        # Convert PN bits to BPSK symbols: {0,1} → {-1,+1}
+        pn_symbols = 2.0 * pn_payload.astype(np.float32) - 1.0
 
-        # Despread by multiplying with PN symbols
+        # Despread: multiply received payload with PN sequence
         despread_symbols = payload_received * pn_symbols
 
-        # CRITICAL: Proper amplitude scaling
-        # The bandpass filter significantly reduces signal amplitude
-        # We need to estimate and compensate for this
+        # Improved LLR calculation
+        # Remove DC bias first
+        despread_mean = np.mean(despread_symbols)
+        despread_centered = despread_symbols - despread_mean
 
-        # Method 1: Adaptive scaling based on despread signal statistics
-        despread_power = np.mean(np.abs(despread_symbols))
-        expected_power = 1.0  # We expect symbols close to ±1
+        # Robust noise estimation using median absolute deviation
+        despread_abs = np.abs(despread_centered)
+        mad = np.median(despread_abs)
+        noise_estimate = mad * 1.4826  # Convert MAD to std for Gaussian
 
-        if despread_power > 1e-6:  # Avoid division by zero
-            amplitude_scale = expected_power / despread_power
-        else:
-            amplitude_scale = 1.0
+        # Fallback if noise estimate is too small
+        if noise_estimate < 0.01:
+            noise_estimate = np.std(despread_centered)
 
-        # Apply amplitude compensation
-        scaled_despread = despread_symbols * amplitude_scale
+        # Prevent division by zero
+        noise_estimate = max(noise_estimate, 0.1)
 
-        # Method 2: Also try scaling based on signal energy
-        signal_rms = np.sqrt(np.mean(payload_received ** 2))
-        if signal_rms > 1e-6:
-            energy_scale = 1.0 / signal_rms
-            energy_scaled_despread = despread_symbols * energy_scale
-        else:
-            energy_scaled_despread = despread_symbols
+        # Scale for LLR - we want reasonable values for the polar decoder
+        llr_scale = 2.0 / (noise_estimate ** 2)
+        llr_scale = np.clip(llr_scale, 0.5, 20.0)  # Limit scaling
 
-        # Use the scaling method that gives more reasonable values
-        if np.std(scaled_despread) > np.std(energy_scaled_despread):
-            final_despread = scaled_despread
-            scale_method = "amplitude"
-        else:
-            final_despread = energy_scaled_despread
-            scale_method = "energy"
+        # Apply scaling
+        llr = despread_centered * llr_scale
 
-        # Convert to LLR with aggressive scaling
-        # LLR should be large enough for polar decoder to work
-        base_scale = 8.0  # Increased from 4.0
+        # Clip to reasonable range
+        llr = np.clip(llr, -10.0, 10.0)
 
-        # Additional adaptive scaling based on signal variance
-        signal_std = np.std(final_despread)
-        if signal_std > 1e-6:
-            adaptive_scale = 2.0 / signal_std  # Target std ≈ 2.0
-            adaptive_scale = np.clip(adaptive_scale, 1.0, 50.0)  # Reasonable bounds
-        else:
-            adaptive_scale = 10.0
-
-        total_scale = base_scale * adaptive_scale
-        llr = final_despread * total_scale
-
-        # Ensure we have the right length for polar decoder
-        if len(llr) < len(pn_payload):
-            # Pad with zeros (neutral LLR)
-            llr_full = np.zeros(len(pn_payload), dtype=np.float32)
-            llr_full[:len(llr)] = llr
+        # Ensure correct length for polar decoder
+        if len(llr) != N_DEFAULT:
+            llr_full = np.zeros(N_DEFAULT, dtype=np.float32)
+            llr_full[:min(len(llr), N_DEFAULT)] = llr[:N_DEFAULT]
             llr = llr_full
 
-        # Clip to prevent overflow in polar decoder
-        llr = np.clip(llr, -30.0, 30.0)
-
-        print(f"[LLR SCALING] ctr={frame_id}, method={scale_method}, "
-              f"amp_scale={amplitude_scale:.3f}, adaptive_scale={adaptive_scale:.3f}, total_scale={total_scale:.3f}")
-        print(f"[LLR FINAL] ctr={frame_id}, "
-              f"llr_range=[{llr.min():.3f}, {llr.max():.3f}], "
-              f"llr_mean={np.mean(llr):.3f}, llr_std={np.std(llr):.3f}")
-
-        # Check if LLR values look reasonable for polar decoding
-        if np.std(llr) < 1.0:
-            print("[WARNING] LLR variance still low - polar decoder may struggle")
-        elif np.std(llr) > 3.0:
-            print("[INFO] LLR variance looks good for polar decoding")
-        else:
-            print("[INFO] LLR variance moderate - should work")
+        print(f"[LLR] ctr={frame_id}: noise_est={noise_estimate:.3f}")
+        print(f"[LLR] final: range=[{llr.min():.3f}, {llr.max():.3f}], mean={np.mean(llr):.3f}, std={np.std(llr):.3f}")
 
         return llr

@@ -1,5 +1,5 @@
 """
-Fixed watermark detector with proper preamble template generation.
+Improved watermark detector with better peak detection and frame handling.
 """
 from __future__ import annotations
 import numpy as np
@@ -9,10 +9,22 @@ from rtwm.utils       import BAND_PLAN, butter_bandpass, resample_to, choose_ban
 from rtwm.crypto      import SecureChannel
 from rtwm.polar_fast  import decode as polar_dec, N_DEFAULT
 
-PREAMBLE      = np.array([1, 0, 1] * 21, dtype=np.uint8)[:63]
-FRAME_LEN     = len(PREAMBLE) + N_DEFAULT          # 1087 chips
+def mseq_63() -> np.ndarray:
+    reg = np.array([1,1,1,1,1,1], dtype=np.uint8)  # x^6 + x + 1
+    out = np.empty(63, dtype=np.uint8)
+    for i in range(63):
+        out[i] = reg[-1]
+        fb = reg[-1] ^ reg[0]
+        reg[1:] = reg[:-1]
+        reg[0] = fb
+    return out
+
+PRE_BITS   = mseq_63()
+PRE_L      = PRE_BITS.size
+FRAME_LEN  = PRE_L + N_DEFAULT
 TIGHT_DELTA   = 3                                  # ±3 quick search
 WIDE_DELTA    = 200                                # one-time fallback
+EPS = 1e-12
 
 class WatermarkDetector:
     """Recover EchoSeal watermark from ≥3 s recording."""
@@ -20,182 +32,136 @@ class WatermarkDetector:
         self.sec          = SecureChannel(key32)
         self.fs_target    = fs_target
         self.session_nonce: bytes | None = None     # 8-byte anti-replay
-        print("Detector hop0:", choose_band(key32, 0))
+        self._band_key = getattr(self.sec, "band_key", key32)
+        self._mf_cache = {}
 
     # ------------------------------------------------------------------ API
     def verify(self, audio: np.ndarray, fs_in: int) -> bool:
         signal, _ = resample_to(self.fs_target, audio, fs_in)
-
-        # try predicted hop band first, then remaining bands
-        hop0 = choose_band(self.sec.master_key, 0)
-        for band in [hop0] + [b for b in BAND_PLAN if b != hop0]:
-            if self._scan_band(signal, band):
+        hop0 = choose_band(self._band_key, 0)
+        if self._scan_band_multi_frame(signal, hop0):
+            return True
+        for band in [b for b in BAND_PLAN if b != hop0]:
+            if self._scan_band_multi_frame(signal, band):
                 return True
         return False
 
     # ------------------------------------------------------------------ band scan
-    def verify_raw_frame(self, signal: np.ndarray) -> bool:
-        """Test a raw frame directly (for debugging)."""
-        # For raw frames that are already filtered and normalized,
-        # we should test them directly without additional filtering
-        print(f"[RAW FRAME TEST] Testing frame of length {len(signal)}")
+    def _scan_band_multi_frame(self, signal: np.ndarray, band) -> bool:
+        # 1) Band-pass once
+        b, a = butter_bandpass(*band, self.fs_target, order=4)
+        y = lfilter(b, a, signal.astype(np.float32, copy=False))
 
-        if len(signal) == FRAME_LEN:
-            # This is a complete frame - try to decode it directly
-            for ctr in range(4):  # Try a few frame counters
-                llr = self._llr(signal, ctr)
+        # 2) Filter the true preamble (zero-state) and unit-normalize template
+        pre_sy = 2.0 * PRE_BITS.astype(np.float32) - 1.0
+        tpl = lfilter(b, a, pre_sy)
+        tpl_norm = float(np.sqrt(np.sum(tpl * tpl)) + 1e-12)
+        tpl = tpl / tpl_norm
 
-                # Quality check
-                llr_std = np.std(llr)
-                print(f"[RAW TEST] ctr={ctr}: LLR std={llr_std:.3f}")
-
-                if llr_std < 0.3:
-                    continue
-
-                blob = polar_dec(llr)
-                if blob is None:
-                    continue
-
-                try:
-                    plain = self.sec.open(blob)
-                    if plain.startswith(b"ESAL"):
-                        embedded_ctr = int.from_bytes(plain[4:8], "big")
-                        if embedded_ctr == ctr:
-                            print(f"[SUCCESS] Raw frame decoded with ctr={ctr}")
-                            return True
-                except:
-                    continue
-
-        # If direct testing fails, we might have an unfiltered frame
-        # Try the band scanning approach
-        band = choose_band(self.sec.master_key, 0)
-        return self._scan_band(signal, band, skip_filtering=False)
-
-    def _scan_band(self, signal: np.ndarray, band, skip_filtering=False) -> bool:
-        """Scan for watermark frames in the given frequency band."""
-        print(f"[SCAN-BAND] Band {band}, signal_len={len(signal)}")
-
-        # Apply bandpass filter to signal
-        b, a = butter_bandpass(*band, self.fs_target)
-        y = lfilter(b, a, signal.astype(np.float32))
-
-        # CRITICAL: Create preamble template the SAME way as TX
-        # The TX applies the filter to the ENTIRE frame (preamble + payload)
-        # So we need to create a template that matches what the filtered preamble looks like
-
-        # First, create a dummy frame to extract just the preamble part
-        preamble_symbols = 2.0 * PREAMBLE.astype(np.float32) - 1.0
-
-        # Create a full dummy frame (preamble + zeros for payload)
-        dummy_frame = np.zeros(FRAME_LEN, dtype=np.float32)
-        dummy_frame[:len(PREAMBLE)] = preamble_symbols
-
-        # Filter the entire dummy frame (same as TX does)
-        dummy_filtered = lfilter(b, a, dummy_frame)
-
-        # Extract just the preamble part after filtering
-        preamble_template = dummy_filtered[:len(PREAMBLE)].copy()
-
-        # Normalize the template (TX normalizes the whole frame, but we only care about preamble correlation)
-        template_energy = np.sum(preamble_template**2)
-        if template_energy > 1e-12:
-            preamble_template /= np.sqrt(template_energy)
-
-        print(f"[SCAN-BAND] Preamble template: mean={np.mean(preamble_template):.6f}, std={np.std(preamble_template):.3f}")
-
-        # Now search for this template in the signal
-        # Use 'valid' mode to avoid edge effects
-        if len(y) < len(preamble_template):
-            print(f"[SCAN-BAND] Signal too short for correlation")
+        L = tpl.size
+        if y.size < L:
             return False
 
-        corr = correlate(y, preamble_template, mode='valid')
+        # 3) Normalized cross-correlation (cosine similarity)
+        y2 = y * y
+        e_y = np.sqrt(np.convolve(y2, np.ones(L, dtype=np.float32), mode='valid')) + 1e-12
+        corr = correlate(y, tpl, mode='valid') / e_y  # in [-1,1]
 
-        # Normalize correlation by local signal energy
-        corr_normalized = np.zeros_like(corr)
-        for i in range(len(corr)):
-            segment = y[i:i+len(preamble_template)]
-            seg_energy = np.sum(segment**2)
-            temp_energy = np.sum(preamble_template**2)
+        # 4) Adaptive threshold via MAD and non-maximum suppression
+        med = float(np.median(corr))
+        mad = float(np.median(np.abs(corr - med))) + 1e-12
+        thr = med + 4.5 * 1.4826 * mad  # ~4.5σ equiv
+        min_distance = FRAME_LEN // 2
 
-            if seg_energy > 1e-12 and temp_energy > 1e-12:
-                corr_normalized[i] = corr[i] / np.sqrt(seg_energy * temp_energy)
-
-        # Find peaks
-        threshold = 0.5  # Correlation threshold
-        peaks = np.where(np.abs(corr_normalized) > threshold)[0]
-
-        print(f"[SCAN-BAND] Found {len(peaks)} peaks above threshold {threshold}")
-
-        if len(peaks) == 0:
-            # Lower threshold and try again
-            threshold = 0.3
-            peaks = np.where(np.abs(corr_normalized) > threshold)[0]
-            print(f"[SCAN-BAND] With lower threshold {threshold}: {len(peaks)} peaks")
-
-        # Try each peak
-        for peak_idx in peaks[:20]:  # Try up to 20 peaks
-            frame_start = peak_idx  # In 'valid' mode, this is the actual start position
-
-            if frame_start + FRAME_LEN > len(y):
+        peaks = []
+        for i in range(corr.size):
+            if corr[i] < thr:
                 continue
+            lo = max(0, i - min_distance)
+            hi = min(corr.size, i + min_distance + 1)
+            if corr[i] >= corr[lo:hi].max():
+                peaks.append(i)
 
-            frame = y[frame_start:frame_start+FRAME_LEN]
+        if not peaks:
+            # Fallback: try top-K peaks if none pass thr
+            k = min(5, corr.size)
+            peaks = list(np.argsort(corr)[-k:][::-1])
 
-            # Estimate frame counter
-            est_ctr = frame_start // FRAME_LEN
+        # 5) Try decode at candidate starts (cap work)
+        tried = 0
+        for peak_idx in peaks[:10]:
+            start = peak_idx
+            if start + FRAME_LEN > y.size:
+                continue
+            frame = y[start:start + FRAME_LEN]
 
-            # Try decoding
-            if self._try_window(frame, est_ctr, TIGHT_DELTA):
-                print(f"[SUCCESS] Frame found at position {frame_start}")
-                return True
+            MAX_CTR = 5000
+            for test_ctr in range(MAX_CTR):
+                if choose_band(self._band_key, test_ctr) != band:
+                    continue
+                if self._try_decode_frame(frame, test_ctr):
+                    return True
+                tried += 1
+                if tried >= 2000:
+                    break
+        return False
+
+    def _try_decode_frame(self, frame: np.ndarray, frame_ctr: int) -> bool:
+        """Try to decode a single frame with a specific counter."""
+        llr = self._llr(frame, frame_ctr)
+
+        # Quality check
+        llr_std = np.std(llr)
+        if llr_std < 0.3:
+            return False
+
+        blob = polar_dec(llr)
+        if blob is None:
+            return False
+
+        try:
+            plain = self.sec.open(blob)
+        except:
+            return False
+
+        if not plain.startswith(b"ESAL"):
+            return False
+
+        embedded_ctr = int.from_bytes(plain[4:8], "big")
+        if embedded_ctr != frame_ctr:
+            return False
+
+        nonce = plain[8:16]
+        if self.session_nonce and nonce == self.session_nonce:
+            return True
+        elif self.session_nonce is None:
+            self.session_nonce = nonce
+            return True
 
         return False
+
+    def verify_raw_frame(self, signal: np.ndarray) -> bool:
+        if len(signal) == FRAME_LEN:
+            # Try a few likely counters; filter with the corresponding band
+            for ctr in range(4):
+                band = choose_band(self._band_key, ctr)
+                b, a = butter_bandpass(*band, self.fs_target, order=4)
+                y = lfilter(b, a, signal.astype(np.float32, copy=False))
+                if self._try_decode_frame(y, ctr):
+                    return True
+        band = choose_band(self._band_key, 0)
+        return self._scan_band_multi_frame(signal, band)
+
+    def _scan_band(self, signal: np.ndarray, band, skip_filtering=False) -> bool:
+        """Legacy method for compatibility."""
+        return self._scan_band_multi_frame(signal, band)
 
     # ------------------------------------------------------------------ window search
     def _try_window(self, frame: np.ndarray, ctr0: int, delta: int) -> bool:
         """Try different frame counter values within window."""
         for ctr in range(max(0, ctr0 - delta), ctr0 + delta + 1):
-            llr = self._llr(frame, ctr)
-
-            # Quality check
-            llr_std = np.std(llr)
-            if llr_std < 0.3:
-                print(f"[RX] ctr={ctr}: LLR variance too low ({llr_std:.3f}), skipping")
-                continue
-
-            print(f"[LLR] ctr={ctr}: range=[{llr.min():.3f}, {llr.max():.3f}], std={llr_std:.3f}")
-
-            blob = polar_dec(llr)
-            if blob is None:
-                print(f"[RX] ctr={ctr}: polar decode failed")
-                continue
-
-            try:
-                plain = self.sec.open(blob)
-                print(f"[RX] ctr={ctr}: decrypt success, checking payload")
-            except Exception as e:
-                print(f"[RX] ctr={ctr}: decrypt failed ({type(e).__name__})")
-                continue
-
-            if not plain.startswith(b"ESAL"):
-                print(f"[RX] ctr={ctr}: bad prefix: {plain[:4]}")
-                continue
-
-            embedded_ctr = int.from_bytes(plain[4:8], "big")
-            if embedded_ctr != ctr:
-                print(f"[RX] ctr={ctr}: counter mismatch (embedded={embedded_ctr})")
-                continue
-
-            nonce = plain[8:16]
-            if self.session_nonce and nonce == self.session_nonce:
-                print(f"[SUCCESS] ctr={ctr}: watermark verified (repeat nonce)")
+            if self._try_decode_frame(frame, ctr):
                 return True
-            elif self.session_nonce is None:
-                self.session_nonce = nonce
-                print(f"[SUCCESS] ctr={ctr}: watermark verified (new nonce)")
-                return True
-
         return False
 
     # ------------------------------------------------------------------ helpers
@@ -207,10 +173,10 @@ class WatermarkDetector:
         """
         # Get PN sequence for this frame
         pn_full = self.sec.pn_bits(frame_id, FRAME_LEN)
-        pn_payload = pn_full[len(PREAMBLE):]
+        pn_payload = pn_full[PRE_L:]
 
         # Extract payload part
-        payload_received = frame[len(PREAMBLE):].copy()
+        payload_received = frame[PRE_L:].copy()
 
         # Ensure consistent lengths
         min_len = min(len(payload_received), len(pn_payload))
@@ -255,8 +221,4 @@ class WatermarkDetector:
             llr_full = np.zeros(N_DEFAULT, dtype=np.float32)
             llr_full[:min(len(llr), N_DEFAULT)] = llr[:N_DEFAULT]
             llr = llr_full
-
-        print(f"[LLR] ctr={frame_id}: noise_est={noise_estimate:.3f}")
-        print(f"[LLR] final: range=[{llr.min():.3f}, {llr.max():.3f}], mean={np.mean(llr):.3f}, std={np.std(llr):.3f}")
-
-        return llr
+        return llr.astype(np.float32, copy=False)

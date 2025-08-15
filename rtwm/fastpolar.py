@@ -1,97 +1,154 @@
-"""
-Minimal standalone Polar Code implementation with CRC and SC-List decoding.
-Inspired by Arikan's original construction. For use in real-time audio watermarking.
-"""
-import os
-import numpy as np
+from __future__ import annotations
+from dataclasses import dataclass, field
 from itertools import combinations
-
+from typing import Optional, Sequence, Tuple
+import numpy as np
 from rtwm.reliability_polar_bits import Q_Nmax
 
+def _parse_reliability_indices(N: int) -> np.ndarray:
+    rel = np.fromiter((int(x) for x in Q_Nmax.split()), dtype=np.int64)
+    if rel.size != N:
+        raise ValueError(f"Q_Nmax must have {N} entries (has {rel.size})")
+    if np.any(rel < 0) or np.any(rel >= N) or np.unique(rel).size != N:
+        raise ValueError("Q_Nmax must be a permutation of 0..N-1")
+    return rel
 
+@dataclass(slots=True)
 class PolarCode:
-    def __init__(self, N: int, K: int, list_size: int = 1, crc_size: int = 8):
-        assert (N & (N - 1)) == 0, "N must be power of 2"
-        self.N = N
-        self.K = K
-        self.L = list_size
-        self.crc_size = crc_size
-        self.frozen = self._select_frozen_bits(N, K)
-        self.crc_poly = 0x107  # CRC-8 poly (x^8 + x^2 + x + 1)
-        print(f"[POLAR INIT] Frozen bits: {np.where(self.frozen)[0][:10]}...")
-        print(f"[POLAR INIT] frozen sum: {np.sum(self.frozen)}, frozen[:10]: {np.where(self.frozen)[0][:10]}")
+    N: int
+    K: int                   # info + CRC bits
+    list_size: int = 8
+    crc_size: int = 8
+    debug: bool = False
 
-    def _select_frozen_bits(self, N, K):
-        reliability = np.array(list(map(int, Q_Nmax.split())))  # 1024 elements
-        assert len(reliability) == N, f"Q_Nmax must have {N} entries"
+    # ---- predeclare slot-backed internals ----
+    _crc_poly: np.uint8 = field(init=False, repr=False, default=np.uint8(0x07))
+    frozen: np.ndarray = field(init=False, repr=False, default=None)
+    _data_pos: np.ndarray = field(init=False, repr=False, default=None)
+    _u_buf: np.ndarray = field(init=False, repr=False, default=None)
 
-        frozen_mask = np.ones(N, dtype=bool)  # everything frozen by default
-        frozen_mask[reliability[:K]] = False  # unfreeze the K most reliable bits
-        return frozen_mask
-    # def _select_frozen_bits(self, N, K):
-    #     reliability = sorted(range(N), key=lambda x: bin(x).count("1"))
-    #     frozen = np.ones(N, dtype=bool)
-    #     for i in reliability[-K:]:
-    #         frozen[i] = False
-    #     return frozen
+    def __post_init__(self) -> None:
+        if self.N <= 0 or (self.N & (self.N - 1)) != 0:
+            raise ValueError("N must be a power of 2 and > 0")
+        if not (0 < self.K <= self.N):
+            raise ValueError("0 < K <= N must hold")
+        if self.list_size < 1:
+            raise ValueError("list_size must be >= 1")
+        if not (0 < self.crc_size < self.K):
+            raise ValueError("0 < crc_size < K must hold")
 
-    def _crc8(self, bits):
-        poly = np.uint8(self.crc_poly & 0xFF)
-        reg = np.uint8(0)
+        # _crc_poly already declared with default; keep as 0x07
+        rel = _parse_reliability_indices(self.N)
 
-        for b in bits:
-            reg ^= np.uint8(b << 7)
-            for _ in range(8):
-                if reg & 0x80:
-                    reg = np.uint8((reg << 1) ^ poly)
-                else:
-                    reg = np.uint8(reg << 1)
+        # frozen mask (True=frozen), unfreeze K most reliable
+        self.frozen = np.ones(self.N, dtype=bool)
+        self.frozen[rel[-self.K:]] = False
 
-        bits8 = np.unpackbits(np.array([reg], dtype=np.uint8))
-        return bits8[-8:]  # ensure exactly 8 bits
+        self._data_pos = np.flatnonzero(~self.frozen)
+        if self._data_pos.size != self.K:
+            raise RuntimeError("Internal error: data positions != K")
 
-    def encode(self, bits: np.ndarray) -> np.ndarray:
-        if len(bits) != self.K - self.crc_size:
-            raise ValueError(f"input must be {self.K - self.crc_size} bits (K - CRC)")
+        self._u_buf = np.empty(self.N, dtype=np.uint8)
 
-        u = np.zeros(self.N, dtype=np.uint8)
-        idx = np.where(~self.frozen)[0]
-        crc = self._crc8(bits)
-        bits_with_crc = np.concatenate((bits[:self.K - self.crc_size], crc))
-        u[idx] = bits_with_crc
+    # --------------- API ---------------
+    def encode(self, info_bits: np.ndarray) -> np.ndarray:
+        if info_bits.dtype != np.uint8:
+            info_bits = info_bits.astype(np.uint8, copy=False)
+        if info_bits.ndim != 1:
+            raise ValueError("info_bits must be a 1D array")
+        if info_bits.size != self.K - self.crc_size:
+            raise ValueError(f"info_bits must have length {self.K - self.crc_size}")
+
+        crc = self._crc8(info_bits)
+        # NOTE: concatenate then cast (dtype kwarg isn’t portable)
+        data = np.concatenate((info_bits, crc)).astype(np.uint8, copy=False)
+
+        u = self._u_buf
+        u.fill(0)
+        u[self._data_pos] = data
         return self._polar_transform(u)
 
-    def decode(self, llr: np.ndarray):
-        return self._sc_list_decode(llr)
+    def decode(self, llr: np.ndarray) -> Tuple[np.ndarray, bool]:
+        if llr.ndim != 1 or llr.size != self.N:
+            raise ValueError(f"llr must be 1D length {self.N}")
 
-    def _sc_list_decode(self, llr):
-        # hard decision: +LLR → 1, –LLR → 0
+        llr = llr.astype(np.float64, copy=False)
 
-        hard_bits = (llr > 0).astype(np.uint8)
+        # hard decision → invert → CRC
+        hard = (llr > 0.0).astype(np.uint8)
+        u_hat = self._polar_transform(hard)
+        data_hat = u_hat[self._data_pos]
+        info0 = data_hat[: self.K - self.crc_size]
+        crc0  = data_hat[self.K - self.crc_size : self.K]
+        if self._crc_ok(info0, crc0):
+            return info0.copy(), True
 
-        # F^{⊗n} is involutory over GF(2) ⇒ applying it again inverts it
-        u_hat = self._polar_transform(hard_bits)
-        data = u_hat[~self.frozen]  # drop frozen positions
-        info, crc = data[:-self.crc_size], data[-self.crc_size:]
+        if self.list_size == 1:
+            return info0.copy(), False
 
-        ok = bool(np.all(self._crc8(info) == crc))
-        if not ok:
-            print("[POLAR] CRC check failed.")
-        return info, ok
+        # Chase: flip least-reliable codeword positions
+        order = np.argsort(np.abs(llr))                 # least reliable first
+        cand_positions = order[:min(16, self.N)]        # cap surface
+        emitted = 1
+        best_ok = None
+        best_any = (np.inf, info0.copy())
 
-    def _llr_metric(self, llr, bit):
-        return llr if bit else -llr
+        for r in range(1, min(5, cand_positions.size) + 1):  # up to 5-bit flips
+            for combo in combinations(cand_positions, r):
+                idx = np.fromiter(combo, dtype=np.int64)
+                metric = float(np.abs(llr[idx]).sum())
+                if best_ok is not None and metric >= best_ok[0]:
+                    continue
 
-    def _polar_transform(self, u):
-        N = len(u)
-        stages = int(np.log2(N))
+                x2 = hard.copy()
+                x2[idx] ^= 1
+                d2 = self._polar_transform(x2)[self._data_pos]
+                info2 = d2[: self.K - self.crc_size]
+                crc2  = d2[self.K - self.crc_size : self.K]
+
+                if self._crc_ok(info2, crc2):
+                    if best_ok is None or metric < best_ok[0]:
+                        best_ok = (metric, info2.copy())
+                else:
+                    if metric < best_any[0]:
+                        best_any = (metric, info2.copy())
+
+                emitted += 1
+                if emitted >= self.list_size:
+                    break
+            if emitted >= self.list_size:
+                break
+
+        if best_ok is not None:
+            return best_ok[1], True
+        return best_any[1], False
+
+    # --------------- internals ---------------
+    def _crc8(self, bits: np.ndarray) -> np.ndarray:
+        reg = np.uint8(0)
+        b = bits.astype(np.uint8, copy=False)
+        for bit in b:
+            reg ^= np.uint8((bit & 1) << 7)
+            if reg & 0x80:
+                reg = np.uint8(((reg << 1) ^ self._crc_poly) & 0xFF)
+            else:
+                reg = np.uint8((reg << 1) & 0xFF)
+        return np.unpackbits(np.array([reg], dtype=np.uint8))
+
+    def _crc_ok(self, info: np.ndarray, crc_bits: np.ndarray) -> bool:
+        return bool(np.all(self._crc8(info) == crc_bits))
+
+    @staticmethod
+    def _polar_transform(u: np.ndarray) -> np.ndarray:
+        N = u.size
         x = u.copy()
+        stages = int(np.log2(N))
         for s in range(stages):
-            step = 2 ** (s + 1)
+            step = 1 << (s + 1)
+            half = step >> 1
             for i in range(0, N, step):
-                for j in range(step // 2):
-                    a = x[i + j]
-                    b = x[i + j + step // 2]
-                    x[i + j] = a ^ b
-                    x[i + j + step // 2] = b
+                a = x[i : i + half]
+                b = x[i + half : i + step]
+                x[i : i + half] = a ^ b
+                x[i + half : i + step] = b
         return x

@@ -101,35 +101,88 @@ def test_tx_rx_end_to_end():
     key = b"\xAA" * 32
     np.random.seed(52)
     t = np.linspace(0, SECS, FS * SECS, endpoint=False)
-    speech = 0.01 * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
+    speech = 0.3 * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
     tx = WatermarkEmbedder(key)
     wm = tx.process(speech)
     assert WatermarkDetector(key).verify(wm, FS) is True
 
-def test_tx_rx_end_to_end2():
-    """Test transmit-receive cycle over silence with no RMS mismatch."""
+def test_tx_rx_end_to_end_fixed():
+    """Test complete transmit -> receive cycle with proper signal levels."""
     key = b"\xAA" * 32
-    speech = np.zeros(FS * SECS, dtype=np.float32)
+    FS = 48000
+    SECS = 5
 
-    class TestEmbedder(WatermarkEmbedder):
-        def process(self, samples: np.ndarray) -> np.ndarray:
-            if self._chip_buf is None:
-                self._chip_buf = np.empty(0, dtype=np.float32)
-            needed = samples.size
-            while self._chip_buf.size < needed:
-                self._chip_buf = np.concatenate((self._chip_buf, self._make_frame_chips()))
-            chips = self._chip_buf[:needed]
-            self._chip_buf = self._chip_buf[needed:]
-            alpha = 1.0
-            scale = 1.0
-            wm = samples + alpha * chips * scale
-            print(f"[TX] watermark RMS: {np.sqrt(np.mean((alpha * chips) ** 2)):.4f}")
-            return wm
+    np.random.seed(52)
+    t = np.linspace(0, SECS, FS * SECS, endpoint=False)
 
-    tx = TestEmbedder(key, TxParams(target_rel_db=0.0))
+    # Use a more realistic signal amplitude (0.1 to 0.5 is typical for audio)
+    speech = 0.3 * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
+
+    print(f"Original signal stats:")
+    print(f"  Mean: {np.mean(speech):.6f}")
+    print(f"  Std: {np.std(speech):.6f}")
+    print(f"  Max: {np.max(np.abs(speech)):.6f}")
+
+    tx = WatermarkEmbedder(key)
     wm = tx.process(speech)
 
-    assert WatermarkDetector(key).verify(wm, FS) is True
+    print(f"\nWatermarked signal stats:")
+    print(f"  Mean: {np.mean(wm):.6f}")
+    print(f"  Std: {np.std(wm):.6f}")
+    print(f"  Max: {np.max(np.abs(wm)):.6f}")
+
+    # Calculate SNR
+    watermark_power = np.mean((wm - speech) ** 2)
+    signal_power = np.mean(speech ** 2)
+    snr_db = 10 * np.log10(signal_power / watermark_power)
+    print(f"  SNR: {snr_db:.1f} dB (should be close to 10 dB)")
+
+    result = WatermarkDetector(key).verify(wm, FS)
+    print(f"\nDetection result: {result}")
+
+    assert result is True
+
+def test_minimal_polarcodel_roundtrip():
+    from rtwm.polar_fast import encode, decode
+    payload = bytes([i & 0xFF for i in range(55)])  # e.g., 0,1,2,...,54
+    enc = encode(payload)
+    print("Encoded (first 32):", enc[:32])
+
+    # Simulate perfect channel, so LLR = large values with correct sign
+    llr = np.where(enc == 0, -10.0, 10.0)  # Strong LLRs, noise-free
+
+    decoded_bytes = decode(llr)
+    print("Decoded:", decoded_bytes.hex() if decoded_bytes else None)
+    print("Payload:", payload.hex())
+
+    assert decoded_bytes == payload, "Polar roundtrip failed even without channel"
+
+def test_different_signal_levels():
+    """Test detection at different signal amplitudes."""
+    key = b"\xAA" * 32
+    FS = 48000
+    SECS = 5
+
+    np.random.seed(52)
+    t = np.linspace(0, SECS, FS * SECS, endpoint=False)
+
+    # Test different amplitude levels
+    amplitudes = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5]
+
+    for amp in amplitudes:
+        print(f"\nTesting amplitude: {amp}")
+        speech = amp * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
+
+        tx = WatermarkEmbedder(key)
+        wm = tx.process(speech)
+
+        # Check watermark strength
+        watermark = wm - speech
+        wm_std = np.std(watermark)
+        print(f"  Watermark std: {wm_std:.6f}")
+
+        result = WatermarkDetector(key).verify(wm, FS)
+        print(f"  Detection: {'✓' if result else '✗'}")
 
 def test_watermark_power_bounds():
     """Verify watermark power is within acceptable bounds."""

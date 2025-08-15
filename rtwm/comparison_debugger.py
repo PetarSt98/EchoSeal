@@ -6,7 +6,7 @@ This will help us find exactly where the signal processing goes wrong.
 
 import numpy as np
 from rtwm.embedder import WatermarkEmbedder, TxParams
-from rtwm.detector import WatermarkDetector
+from rtwm.detector import WatermarkDetector, PRE_BITS, PRE_L, FRAME_LEN
 from rtwm.crypto import SecureChannel
 from rtwm.polar_fast import encode as polar_enc, decode as polar_dec
 from rtwm.utils import butter_bandpass
@@ -31,6 +31,7 @@ def comprehensive_debug():
     tx = WatermarkEmbedder(key)
     tx.frame_ctr = frame_ctr
     payload_bytes = tx._build_payload()
+    tx._build_payload = lambda: payload_bytes  # Monkey-patch so embedder uses the same payload
 
     print(f"Payload: {len(payload_bytes)} bytes")
     print(f"First 16 bytes: {payload_bytes[:16].hex()}")
@@ -40,6 +41,7 @@ def comprehensive_debug():
     print("-" * 40)
 
     payload_bits = np.unpackbits(np.frombuffer(payload_bytes, dtype="u1"))
+
     data_bits = polar_enc(payload_bytes, N=1024, K=448)
 
     print(f"Payload bits: {len(payload_bits)} bits")
@@ -51,9 +53,8 @@ def comprehensive_debug():
     print("-" * 40)
 
     sec = SecureChannel(key)
-    frame_len = 63 + len(data_bits)  # preamble + payload
-    pn_full = sec.pn_bits(frame_ctr, frame_len)
-    pn_payload = pn_full[63:]
+    pn_full = sec.pn_bits(frame_ctr, FRAME_LEN)
+    pn_payload = pn_full[PRE_L:]
 
     print(f"PN full length: {len(pn_full)} bits")
     print(f"PN payload length: {len(pn_payload)} bits")
@@ -63,8 +64,7 @@ def comprehensive_debug():
     print("\n4. TX SYMBOL GENERATION AND SPREADING")
     print("-" * 40)
 
-    preamble = np.array([1, 0, 1] * 21, dtype=np.uint8)[:63]
-    preamble_symbols = 2 * preamble - 1  # No spreading for preamble
+    preamble_symbols = 2.0 * PRE_BITS.astype(np.float32) - 1.0
 
     data_symbols = 2 * data_bits.astype(np.float32) - 1  # Map to ±1
     pn_symbols = 2 * pn_payload.astype(np.float32) - 1  # Map to ±1
@@ -83,12 +83,19 @@ def comprehensive_debug():
     print("-" * 40)
 
     from rtwm.utils import choose_band
-    band = choose_band(key, frame_ctr)
-    b, a = butter_bandpass(*band, fs)
-
-    filtered_symbols = lfilter(b, a, all_symbols)
-    filtered_symbols /= np.sqrt(np.mean(filtered_symbols ** 2)) + 1e-12  # Normalize
-
+    sec = SecureChannel(key)
+    band_key = getattr(sec, "band_key", key)
+    band = choose_band(band_key, frame_ctr)
+    b, a = butter_bandpass(*band, fs, order=4)
+    zi_len = max(len(a), len(b)) - 1
+    zi = np.zeros(zi_len, dtype=np.result_type(a, b, all_symbols))
+    filtered_symbols, _ = lfilter(b, a, all_symbols, zi=zi)
+    start = max(16, zi_len)  # same steady-state window as TX
+    steady = filtered_symbols[start:] if filtered_symbols.size > start else filtered_symbols
+    energy = float(np.mean(steady ** 2))
+    if energy > 1e-12:
+        filtered_symbols /= np.sqrt(energy)
+    filtered_symbols = filtered_symbols.astype(np.float32, copy=False)
     print(f"Band: {band}")
     print(f"Before filtering - mean: {np.mean(all_symbols):.6f}, std: {np.std(all_symbols):.6f}")
     print(f"After filtering - mean: {np.mean(filtered_symbols):.6f}, std: {np.std(filtered_symbols):.6f}")
@@ -99,6 +106,11 @@ def comprehensive_debug():
     print("-" * 40)
 
     tx_chips = tx._make_frame_chips()
+
+    print("TX chips dtype:", tx_chips.dtype, "filtered_symbols dtype:", filtered_symbols.dtype)
+    print("TX chips max:", np.max(np.abs(tx_chips)), "filtered_symbols max:", np.max(np.abs(filtered_symbols)))
+    print("First 10 samples TX chips:", tx_chips[:10])
+    print("First 10 samples filtered_symbols:", filtered_symbols[:10])
 
     print(f"TX chips length: {len(tx_chips)}")
     print(f"TX chips - mean: {np.mean(tx_chips):.6f}, std: {np.std(tx_chips):.6f}")
@@ -116,28 +128,29 @@ def comprehensive_debug():
     detector = WatermarkDetector(key)
 
     # Use the same filtering as TX for preamble template
-    preamble_template = 2 * preamble.astype(np.float32) - 1
+    preamble_template = 2.0 * PRE_BITS.astype(np.float32) - 1.0
     filtered_template = lfilter(b, a, preamble_template)
-    filtered_template /= np.sqrt(np.mean(filtered_template ** 2)) + 1e-12
+    filtered_template /= (np.sqrt(np.sum(filtered_template ** 2)) + 1e-12)
 
     from scipy.signal import correlate
-    correlation = correlate(tx_chips, filtered_template, mode='valid')
-
-    peak_pos = np.argmax(correlation)
-    peak_value = correlation[peak_pos]
+    win_energy = np.sqrt(np.convolve(tx_chips * tx_chips,
+                                     np.ones(filtered_template.size, dtype=np.float32),
+                                     mode='valid')) + 1e-12
+    corr = correlate(tx_chips, filtered_template, mode='valid') / win_energy
+    peak_pos = int(np.argmax(corr))
+    peak_value = float(corr[peak_pos])
 
     print(f"Preamble correlation peak: {peak_value:.3f} at position {peak_pos}")
-    print(f"Expected peak position: ~{31} (half preamble length)")
+    print("Expected peak position: 0 (start-of-frame)")
 
     # Step 8: RX Frame Extraction
     print("\n8. RX FRAME EXTRACTION")
     print("-" * 40)
 
-    peak_shift = (len(preamble) - 1) // 2
-    frame_start = peak_pos - peak_shift
-    extracted_frame = tx_chips[frame_start:frame_start + len(tx_chips)]
+    frame_start = peak_pos
+    extracted_frame = tx_chips[frame_start:frame_start + FRAME_LEN]
 
-    if frame_start < 0 or frame_start + len(tx_chips) > len(tx_chips):
+    if frame_start < 0 or frame_start + FRAME_LEN > len(tx_chips):
         print("WARNING: Frame extraction would go out of bounds!")
         extracted_frame = tx_chips  # Use full signal
         frame_start = 0
@@ -149,7 +162,7 @@ def comprehensive_debug():
     print("\n9. RX PAYLOAD DESPREADING")
     print("-" * 40)
 
-    rx_payload = extracted_frame[63:]  # Skip preamble
+    rx_payload = extracted_frame[PRE_L:]  # Skip preamble
     print(f"RX payload length: {len(rx_payload)}")
     print(f"RX payload - mean: {np.mean(rx_payload):.6f}, std: {np.std(rx_payload):.6f}")
 
@@ -165,66 +178,46 @@ def comprehensive_debug():
     print(f"Despread (first 32): {despread[:32]}")
     print(f"Original data symbols (first 32): {data_symbols[:32]}")
 
-    # Check correlation between despread and original data
-    correlation_coeff = np.corrcoef(despread, data_symbols[:len(despread)])[0, 1]
-    print(f"Correlation with original data symbols: {correlation_coeff:.6f}")
-
-    # Step 10: LLR Calculation and Polar Decoding
+    # Step 10: LLR CALCULATION AND POLAR DECODING
     print("\n10. LLR CALCULATION AND POLAR DECODING")
     print("-" * 40)
 
-    # Simple LLR: just scale the despread symbols
-    llr_scale = 8.0
-    llr = despread * llr_scale
-    llr = np.clip(llr, -30.0, 30.0)
+    # Use the detector's LLR exactly as in production RX
+    llr = detector._llr(tx_chips, frame_ctr)  # float32, length 1024
+    print(f"LLR - mean: {llr.mean():.6f}, std: {llr.std():.6f}, "
+          f"range: [{llr.min():.3f}, {llr.max():.3f}]")
 
-    # Pad to correct length if needed
-    if len(llr) < 1024:
-        llr_padded = np.zeros(1024, dtype=np.float32)
-        llr_padded[:len(llr)] = llr
-        llr = llr_padded
-
-    print(f"LLR - mean: {np.mean(llr):.6f}, std: {np.std(llr):.6f}")
-    print(f"LLR range: [{llr.min():.3f}, {llr.max():.3f}]")
-
-    # Try polar decoding
+    # Decode; if CRC fails (None), try a sign-flip once as a diagnostic
     decoded_bytes = polar_dec(llr)
+    if decoded_bytes is None:
+        decoded_bytes = polar_dec(-llr)
 
-    if decoded_bytes is not None:
-        print(f"Polar decoding: SUCCESS")
-        print(f"Decoded length: {len(decoded_bytes)} bytes")
-        print(f"Original payload: {payload_bytes[:16].hex()}")
-        print(f"Decoded payload:  {decoded_bytes[:16].hex()}")
-        print(f"Payloads match: {payload_bytes == decoded_bytes}")
+    print("\n[DEBUG] --- POLAR DECODER BYTEWISE CHECK ---")
+    if decoded_bytes is None:
+        print("[DEBUG] Decoder failed CRC (no bytes returned).")
+        success = False
     else:
-        print(f"Polar decoding: FAILED")
-
-        # Try different LLR scales
-        print("Trying different LLR scales...")
-        for scale in [1.0, 2.0, 4.0, 16.0, 32.0]:
-            test_llr = np.clip(despread * scale, -30.0, 30.0)
-            if len(test_llr) < 1024:
-                test_llr_padded = np.zeros(1024, dtype=np.float32)
-                test_llr_padded[:len(test_llr)] = test_llr
-                test_llr = test_llr_padded
-
-            test_decoded = polar_dec(test_llr)
-            success = test_decoded is not None
-            print(f"  Scale {scale:4.1f}: {'SUCCESS' if success else 'FAILED'}")
-
-            if success and test_decoded == payload_bytes:
-                print(f"    ✓ Perfect match with original payload!")
-                return True
+        print(f"[DEBUG] Encoded payload bytes: {payload_bytes.hex()}")
+        print(f"[DEBUG] Decoded bytes:        {decoded_bytes.hex()}")
+        success = (decoded_bytes == payload_bytes)
+        if not success:
+            print("[DEBUG] Payloads do NOT match, byte-wise differences:")
+            for i, (a, b) in enumerate(zip(payload_bytes, decoded_bytes)):
+                if a != b:
+                    print(f"  Byte {i}: encoded={a:02x} decoded={b:02x}")
+            if len(payload_bytes) != len(decoded_bytes):
+                print(f"[DEBUG] Length mismatch: encoded {len(payload_bytes)} vs decoded {len(decoded_bytes)}")
+            print(f"[DEBUG] Last byte of encoded: {payload_bytes[-1]:02x}")
+            print(f"[DEBUG] Last byte of decoded: {decoded_bytes[-1]:02x}")
 
     print("\n" + "=" * 80)
     print("DEBUG SUMMARY")
     print("=" * 80)
-    print(f"Correlation with original data: {correlation_coeff:.6f}")
     print(f"Polar decoding success: {decoded_bytes is not None}")
     if decoded_bytes is not None:
-        print(f"Payload match: {payload_bytes == decoded_bytes}")
+        print(f"Payload match: {success}")
 
-    return decoded_bytes is not None and payload_bytes == decoded_bytes
+    return (decoded_bytes is not None) and success
 
 
 if __name__ == "__main__":

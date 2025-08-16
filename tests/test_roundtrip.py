@@ -1,7 +1,7 @@
 
 import numpy as np
 from rtwm.embedder import WatermarkEmbedder, TxParams
-from rtwm.detector import WatermarkDetector
+from rtwm.detector import WatermarkDetector, mseq_63
 from rtwm.polar_fast import N_DEFAULT, K_DEFAULT
 from rtwm.utils import lin_to_db, db_to_lin
 from rtwm.fastpolar import PolarCode
@@ -81,66 +81,103 @@ def test_minimal_signal():
 
     return result
 
-def test_debug():
-    from rtwm.crypto import SecureChannel
-    sec = SecureChannel(b"\xAA" * 32)
 
-    # PN that the **receiver** will use for the first frame
-    rx_pn = sec.pn_bits(0, 1087)[63:]  # skip the pre-amble
-
+def test_tx_rx_end_to_end_minimal():
+    """Minimal test that should work."""
     from rtwm.embedder import WatermarkEmbedder
-    tx = WatermarkEmbedder(b"\xAA" * 32)
+    from rtwm.detector import WatermarkDetector
+    from scipy.signal import chirp
+    import numpy as np
 
-    # The sign TX actually multiplies the first payload chip with:
-    first_sym_sign = (2 * tx._make_frame_chips().copy()[:64] > 0).astype(int)[63]
-
-    print(rx_pn[0], first_sym_sign)
-
-def test_tx_rx_end_to_end():
-    """Test complete transmit -> receive cycle."""
-    key = b"\xAA" * 32
-    np.random.seed(52)
-    t = np.linspace(0, SECS, FS * SECS, endpoint=False)
-    speech = 0.3 * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
-    tx = WatermarkEmbedder(key)
-    wm = tx.process(speech)
-    assert WatermarkDetector(key).verify(wm, FS) is True
-
-def test_tx_rx_end_to_end_fixed():
-    """Test complete transmit -> receive cycle with proper signal levels."""
     key = b"\xAA" * 32
     FS = 48000
     SECS = 5
 
     np.random.seed(52)
     t = np.linspace(0, SECS, FS * SECS, endpoint=False)
-
-    # Use a more realistic signal amplitude (0.1 to 0.5 is typical for audio)
     speech = 0.3 * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
-
-    print(f"Original signal stats:")
-    print(f"  Mean: {np.mean(speech):.6f}")
-    print(f"  Std: {np.std(speech):.6f}")
-    print(f"  Max: {np.max(np.abs(speech)):.6f}")
 
     tx = WatermarkEmbedder(key)
     wm = tx.process(speech)
-
-    print(f"\nWatermarked signal stats:")
-    print(f"  Mean: {np.mean(wm):.6f}")
-    print(f"  Std: {np.std(wm):.6f}")
-    print(f"  Max: {np.max(np.abs(wm)):.6f}")
-
-    # Calculate SNR
-    watermark_power = np.mean((wm - speech) ** 2)
-    signal_power = np.mean(speech ** 2)
-    snr_db = 10 * np.log10(signal_power / watermark_power)
-    print(f"  SNR: {snr_db:.1f} dB (should be close to 10 dB)")
-
-    result = WatermarkDetector(key).verify(wm, FS)
-    print(f"\nDetection result: {result}")
+    print(f"Signal power: {np.mean(speech ** 2):.6f}")
+    print(f"Watermark power: {np.mean((wm - speech) ** 2):.6f}")
+    print(f"SNR: {10 * np.log10(np.mean(speech ** 2) / np.mean((wm - speech) ** 2)):.1f} dB")
+    if np.array_equal(wm, speech):
+        print("WARNING: Watermark not embedded!")
+    rx = WatermarkDetector(key)
+    result = rx.verify(wm, FS)
 
     assert result is True
+
+def test_tx_rx_end_to_end_debug():
+    """Test with debug output."""
+    key = b"\xAA" * 32
+    FS = 48000
+    SECS = 5
+
+    np.random.seed(52)
+    t = np.linspace(0, SECS, FS * SECS, endpoint=False)
+    speech = 0.3 * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
+
+    print(f"Input signal: shape={speech.shape}, dtype={speech.dtype}")
+    print(f"Input signal stats: mean={np.mean(speech):.4f}, std={np.std(speech):.4f}")
+
+    tx = WatermarkEmbedder(key)
+
+    # Check embedder state
+    print(f"TX session nonce: {tx._session_nonce.hex()}")
+    print(f"TX initial frame_ctr: {tx.frame_ctr}")
+
+    wm = tx.process(speech)
+
+    print(f"TX final frame_ctr: {tx.frame_ctr}")
+    print(f"Watermarked signal: shape={wm.shape}, dtype={wm.dtype}")
+    print(f"Watermarked stats: mean={np.mean(wm):.4f}, std={np.std(wm):.4f}")
+
+    # Check if watermark was actually added
+    diff = wm - speech
+    print(f"Watermark component: mean={np.mean(diff):.6f}, std={np.std(diff):.6f}")
+
+    rx = WatermarkDetector(key)
+
+    # Add a method to check if preambles match
+    tx_preamble = tx.mseq_63()
+    rx_preamble = mseq_63()  # from detector.py
+    print(f"Preambles match: {np.array_equal(tx_preamble, rx_preamble)}")
+    if not np.array_equal(tx_preamble, rx_preamble):
+        print(f"TX preamble[:10]: {tx_preamble[:10]}")
+        print(f"RX preamble[:10]: {rx_preamble[:10]}")
+
+    # Try detection
+    result = rx.verify(wm, FS)
+    print(f"Detection result: {result}")
+
+    return result
+
+
+def test_tx_rx_end_to_end_fixed():
+    """Test complete transmit -> receive cycle."""
+    key = b"\xAA" * 32
+    FS = 48000
+    SECS = 5
+
+    np.random.seed(52)
+    t = np.linspace(0, SECS, FS * SECS, endpoint=False)
+    speech = 0.3 * chirp(t, f0=300, f1=3500, t1=SECS, method='linear').astype(np.float32)
+
+    # Create embedder and embed watermark
+    tx = WatermarkEmbedder(key)
+    wm = tx.process(speech)
+
+    # Create detector and verify
+    rx = WatermarkDetector(key)
+    result = rx.verify(wm, FS)
+
+    # Add assertion with helpful error message
+    assert result is True, f"Detection failed. TX generated {tx.frame_ctr} frames"
+
+    return result
+
 
 def test_minimal_polarcodel_roundtrip():
     from rtwm.polar_fast import encode, decode

@@ -77,6 +77,7 @@ class PolarCode:
         # hard decision → invert → CRC
         hard = (llr > 0.0).astype(np.uint8)
         u_hat = self._polar_transform(hard)
+        u_hat[self.frozen] = 0
         data_hat = u_hat[self._data_pos]
         info0 = data_hat[: self.K - self.crc_size]
         crc0  = data_hat[self.K - self.crc_size : self.K]
@@ -102,7 +103,9 @@ class PolarCode:
 
                 x2 = hard.copy()
                 x2[idx] ^= 1
-                d2 = self._polar_transform(x2)[self._data_pos]
+                u2 = self._polar_transform(x2)
+                u2[self.frozen] = 0  # <-- NEW: enforce code constraint
+                d2 = u2[self._data_pos]
                 info2 = d2[: self.K - self.crc_size]
                 crc2  = d2[self.K - self.crc_size : self.K]
 

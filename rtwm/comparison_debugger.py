@@ -182,10 +182,22 @@ def comprehensive_debug():
     print("\n10. LLR CALCULATION AND POLAR DECODING")
     print("-" * 40)
 
+    sec_tx = SecureChannel(key)
+    pn_tx = sec_tx.pn_bits(frame_ctr, FRAME_LEN)
+
+    sec_rx = detector.sec
+    pn_rx = sec_rx.pn_bits(frame_ctr, FRAME_LEN)
+
+    print("PN identical:", np.array_equal(pn_tx, pn_rx))
+
     # Use the detector's LLR exactly as in production RX
     llr = detector._llr(tx_chips, frame_ctr)  # float32, length 1024
     print(f"LLR - mean: {llr.mean():.6f}, std: {llr.std():.6f}, "
           f"range: [{llr.min():.3f}, {llr.max():.3f}]")
+    hd = np.mean(((llr > 0).astype(np.uint8) ^ data_bits).astype(np.float32))
+    print(f"Hard-decision BER vs codeword: {hd:.3f}")
+    ber = np.mean(((llr > 0).astype(np.uint8) ^ data_bits).astype(np.float32))
+    print(f"Hard-decision BER vs codeword: {ber:.3f}")
 
     # Decode; if CRC fails (None), try a sign-flip once as a diagnostic
     decoded_bytes = polar_dec(llr)
@@ -216,6 +228,15 @@ def comprehensive_debug():
     print(f"Polar decoding success: {decoded_bytes is not None}")
     if decoded_bytes is not None:
         print(f"Payload match: {success}")
+
+    best = (-1.0, 0)
+    sym = 2 * data_bits.astype(np.int8) - 1
+    for k in range(-64, 65):
+        s = np.sign(np.roll(llr, k)).astype(np.int8)
+        corr = float(np.mean(s[:len(sym)] * sym))
+        if corr > best[0]:
+            best = (corr, k)
+    print(f"Best corr vs codeword: {best[0]:.3f} at shift {best[1]} samples")
 
     return (decoded_bytes is not None) and success
 

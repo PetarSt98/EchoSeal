@@ -4,6 +4,7 @@ Improved watermark detector with better peak detection and frame handling.
 from __future__ import annotations
 import numpy as np
 from scipy.signal import lfilter, correlate
+from cryptography.exceptions import InvalidTag
 
 from rtwm.utils       import BAND_PLAN, butter_bandpass, resample_to, choose_band
 from rtwm.crypto      import SecureChannel
@@ -95,10 +96,8 @@ class WatermarkDetector:
             print(f"[SCAN] No peaks above threshold, using top-K fallback")
         # 5) Try decode at candidate starts with *time-based* counter window
         tried = 0
-        MAX_TRIES = 1000  # overall budget per band pass (fast!)
-        WINDOW_NARROW = 8
-        WINDOW_WIDE = 64
-        PEAK_LIMIT=40
+        MAX_TRIES = 400  # overall budget per band pass (fast!)
+        PEAK_LIMIT=25
 
         for peak_idx in peaks[:PEAK_LIMIT]:
             start = peak_idx
@@ -106,23 +105,29 @@ class WatermarkDetector:
                 continue
             frame = y[start:start + FRAME_LEN]
 
-            # Estimate frame counter from time index
+              # --- estimate the frame counter from time index
             ctr_est = int(round(start / FRAME_LEN))
             cand_ctrs: list[int] = []
+            # Tight search first
 
-            # First: narrow window and only counters that hop to this band
-            for ctr in range(max(0, ctr_est - WINDOW_NARROW), ctr_est + WINDOW_NARROW + 1):
+            for ctr in range(max(0, ctr_est - TIGHT_DELTA), ctr_est + TIGHT_DELTA + 1):
+
                 if choose_band(self._band_key, ctr) == band:
                     cand_ctrs.append(ctr)
+              # If nothing worked, widen the window (bounded by remaining budget)
 
-            # Fallback: widen a bit if nothing matched (should be rare)
             if not cand_ctrs:
-                for ctr in range(max(0, ctr_est - WINDOW_WIDE), ctr_est + WINDOW_WIDE + 1):
+                lo = max(0, ctr_est - WIDE_DELTA)
+                hi = ctr_est + WIDE_DELTA + 1
+
+                for ctr in range(lo, hi):
+
                     if choose_band(self._band_key, ctr) == band:
                         cand_ctrs.append(ctr)
-                        if len(cand_ctrs) >= 16:  # cap work
-                            break
-            print(f"[SCAN] Peak at {start}, est_ctr={ctr_est}, trying counters: {cand_ctrs[:10]}")
+
+            print(f"  Peak@{start}: ctr_est={ctr_est}, trying {len(cand_ctrs)} counters "
+                f"(±{TIGHT_DELTA} then ±{WIDE_DELTA})")
+
             for ctr in cand_ctrs:
                 print(f"  Trying ctr={ctr}")
                 if self._try_decode_frame(frame, ctr):
@@ -135,31 +140,49 @@ class WatermarkDetector:
 
     def _try_decode_frame(self, frame: np.ndarray, frame_ctr: int) -> bool:
         """Try to decode a single frame with a specific counter."""
+        print(f"[DECODE DEBUG] Trying frame counter {frame_ctr}")
+        print(f"[DECODE DEBUG] Frame shape: {frame.shape}")
+        print(f"[DECODE DEBUG] Frame[:8]: {frame[:8]}")
+        print(f"[DECODE DEBUG] Frame RMS: {np.sqrt(np.mean(frame ** 2)):.8f}")
         llr = self._llr(frame, frame_ctr)
-
+        print(f"[DECODE DEBUG] LLR computed, shape: {llr.shape}")
+        print(f"[DECODE DEBUG] LLR[:8]: {llr[:8]}")
+        print(f"[DECODE DEBUG] LLR[-8:]: {llr[-8:]}")
         # Quality check
-        llr_std = np.std(llr)
-        print(f"    LLR std: {llr_std:.3f}")
-        if llr_std < 0.3:
-            print(f"    Rejected - LLR std too low")
-            return False
 
-        blob = polar_dec(llr, list_size=64)
+        print(f"[DECODE DEBUG] LLR std check passed, proceeding to polar decode")
+        def _validator(payload: bytes) -> bool:
+            try:
+                pt = self.sec.open(payload)
+            except Exception:
+                return False
+            if not pt.startswith(b"ESAL"):
+                return False
+            return int.from_bytes(pt[4:8], "big") == frame_ctr
+
+        blob = polar_dec(llr, list_size=256, validator=_validator)
+        print(f"    LLR[:8]: {llr[:8]}")
+        print(f"    LLR[-8:]: {llr[-8:]}")
+        print(f"    LLR mean: {np.mean(llr):.3f}, std: {np.std(llr):.3f}")
         if blob is None:
-            blob = polar_dec(-llr, list_size=64)
+            blob = polar_dec(-llr, list_size=256, validator=_validator)
             if blob is None:
                 print(f"    Polar decode failed")
                 return False
+        print(f"    Blob head (8B): {blob[:8].hex()}")
+
         print(f"    Polar decode OK, blob len: {len(blob)}")
         try:
             plain = self.sec.open(blob)
-            print(f"    Crypto OK, plain len: {len(plain)}")
+            print(f"    Crypto OK, plain len: {len(plain)}; "
+                  f"magic={plain[:4]!r}, ctr={int.from_bytes(plain[4:8], 'big')}")
         except Exception  as e:
             if len(blob) >= 4 and blob[:4] == b"ESAL":
                 plain = blob
                 print("    Crypto skipped: payload appears to be PLAINTEXT (legacy mode)")
             else:
-                print(f"    Crypto failed: {e}")
+                head = blob[:8].hex()
+                print(f"    Crypto failed: {type(e).__name__}: {e}; blob[:8]={head}")
                 return False
 
         if not plain.startswith(b"ESAL"):
@@ -264,46 +287,58 @@ class WatermarkDetector:
         rx = rx[:n]
         pn_sy = pn_sy[:n]
 
+        # Add this right after: pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0
+        print(f"[DETECTOR] Frame {frame_id}")
+        print(f"  pn_payload[:32]: {pn_payload[:32]}")
+        print(f"  rx[:8]: {rx[:8]}")
+        print(f"  despread[:8] (before shift search): {(rx[:8] * pn_sy[:8])}")
+
         # --- matched filter (long, truncated to ~99.9% energy)
         band = choose_band(self._band_key, frame_id)
         h = self._matched_filter_taps(band)
         mf = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
         offset = len(h) - 1
-        mf_raw = mf[offset:offset + n]  # nominal chip-synchronous slice
+        MAX_SHIFT = 64
+        MARGIN = MAX_SHIFT
+        start = max(0, offset - MARGIN)
+        stop = min(mf.size, offset + n + MARGIN)
+        mf_win = mf[start:stop]
+        base = offset - start  # zero-shift index within mf_win
+
 
         # --- guard region to avoid preamble tail bias
         guard = int(max(16, min(64, len(h) // 8)))
-        if guard >= mf_raw.size:
-            guard = max(0, mf_raw.size // 4)
+        if guard >= n:
+            guard = max(0, n // 4)
 
         # --- integer shift search (sign-invariant): maximize mean |despread|
-        MAX_SHIFT = 24
         best_s = 0
         best_score = -1.0
         for s in range(-MAX_SHIFT, MAX_SHIFT + 1):
-            if s >= 0:
-                a = mf_raw[s:]
-                b = pn_sy[:a.size]
-            else:
-                a = mf_raw[:mf_raw.size + s]
-                b = pn_sy[-s: -s + a.size]
-            if a.size <= guard + 8:
+            i0 = base + s
+            i1 = i0 + n
+            if i0 < 0 or i1 > mf_win.size:
                 continue
+            a = mf_win[i0:i1]  # length == n
+            b = pn_sy[:n]  # length == n
             d = a * b
-            score = float(np.mean(np.abs(d[guard:])))
+            score = float(np.mean(np.abs(d[guard:])))  # sign-invariant
             if score > best_score:
                 best_score = score
                 best_s = s
 
         # --- apply the best shift
-        if best_s >= 0:
-            mf_aligned = mf_raw[best_s:]
-            pn_used = pn_sy[:mf_aligned.size]
-        else:
-            mf_aligned = mf_raw[:mf_raw.size + best_s]
-            pn_used = pn_sy[-best_s: -best_s + mf_aligned.size]
+        i0 = base + best_s
+        i1 = i0 + n
+        mf_aligned = mf_win[i0:i1]  # length == n
+        despread = mf_aligned * pn_sy[:n]
 
-        despread = mf_aligned * pn_used
+        # --- after picking best_s, before building despread ---
+        print(f"[LLR ALIGN] best_s={best_s}, n={n}, len(h)={len(h)}, "
+              f"mf_total={mf.size}, fixed_slice=[{offset}:{offset + n}] ")
+
+        # Keep existing code that forms 'despread'...
+        print(f"[LLR ALIGN] aligned_len={despread.size}, guard={guard}")
 
         # --- LLR normalization (use tail to estimate mu/sigma)
         tail = despread[guard:] if despread.size > guard + 8 else despread
@@ -318,108 +353,42 @@ class WatermarkDetector:
         scale = float(np.clip(2.0 / (sigma * sigma), 0.5, 30.0))
         llr = np.clip(llr_raw * scale, -12.0, 12.0).astype(np.float32, copy=False)
 
-        # --- ensure length N
+        tail_zeros = int(np.sum(np.isclose(llr[-64:], 0.0)))
+        print(f"[LLR ALIGN] N={N}, llr_len={llr.size}, tail_zeros_64={tail_zeros}")
+
         if llr.size != N:
             out = np.zeros(N, dtype=np.float32)
             m = min(llr.size, N)
             out[:m] = llr[:m]
             llr = out
+
         return llr
 
-    # def _llr(self, frame: np.ndarray, frame_id: int) -> np.ndarray:
-    #     """
-    #     Produce length-N LLRs for the payload. Steps:
-    #       1) matched-filter with long cached taps,
-    #       2) search an integer chip-phase shift using a sign-invariant metric,
-    #       3) despread with PN at the chosen shift,
-    #       4) robust LLR normalization.
-    #     """
-    #     N = N_DEFAULT
-    #
-    #     # --- PN for FULL frame (preamble + payload); we need payload part
-    #     pn_full = self.sec.pn_bits(frame_id, FRAME_LEN)
-    #     pn_payload = pn_full[PRE_L:]
-    #     pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0  # ±1
-    #
-    #     # --- payload segment after preamble
-    #     rx = frame[PRE_L:].astype(np.float32, copy=False)
-    #     n = min(rx.size, pn_sy.size)
-    #     if n <= 0:
-    #         return np.zeros(N, dtype=np.float32)
-    #     rx = rx[:n]
-    #     pn_sy = pn_sy[:n]
-    #
-    #     # --- matched filter (long, truncated to ~99.9% energy)
-    #     band = choose_band(self._band_key, frame_id)
-    #     h = self._matched_filter_taps(band)
-    #     mf = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
-    #     offset = len(h) - 1
-    #     mf_raw = mf[offset:offset + n]  # nominal chip-synchronous slice
-    #
-    #     # --- guard region: early samples still carry preamble tail; don't trust them for stats
-    #     # heuristic: ~len(h)/8, clamped to [16, 64]
-    #     guard = int(max(16, min(64, len(h) // 8)))
-    #     if guard >= mf_raw.size:
-    #         guard = max(0, mf_raw.size // 4)
-    #
-    #     # --- integer offset search using a sign-invariant metric (maximize mean |despread|)
-    #     MAX_SHIFT = 24
-    #     best_s = 0
-    #     best_score = -1.0
-    #
-    #     for s in range(-MAX_SHIFT, MAX_SHIFT + 1):
-    #         if s >= 0:
-    #             a = mf_raw[s:]
-    #             b = pn_sy[:a.size]
-    #         else:
-    #             a = mf_raw[:mf_raw.size + s]
-    #             b = pn_sy[-s: -s + a.size]
-    #         if a.size <= guard + 8:  # need some tail to score
-    #             continue
-    #
-    #         d = a * b  # despread at this shift
-    #         score = float(np.mean(np.abs(d[guard:])))  # sign-invariant energy
-    #         if score > best_score:
-    #             best_score = score
-    #             best_s = s
-    #
-    #     # --- apply best shift
-    #     if best_s >= 0:
-    #         mf_aligned = mf_raw[best_s:]
-    #         pn_used = pn_sy[:mf_aligned.size]
-    #     else:
-    #         mf_aligned = mf_raw[:mf_raw.size + best_s]
-    #         pn_used = pn_sy[-best_s: -best_s + mf_aligned.size]
-    #
-    #     despread = mf_aligned * pn_used
-    #
-    #     # --- LLR normalization (use tail region for stable stats)
-    #     if despread.size > guard + 8:
-    #         tail = despread[guard:]
-    #     else:
-    #         tail = despread
-    #
-    #     # center using tail (reduces bias from early transient)
-    #     mu = float(np.mean(tail))
-    #     llr_raw = despread - mu
-    #
-    #     # robust sigma
-    #     mad = float(np.median(np.abs(tail - float(np.median(tail))))) + 1e-12
-    #     sigma_mad = 1.4826 * mad
-    #     sigma_std = float(np.std(tail)) + 1e-12
-    #     sigma = max(sigma_mad, sigma_std, 0.1)
-    #
-    #     # AWGN-ish scaling; allow stronger confidence if channel is clean
-    #     scale = float(np.clip(2.0 / (sigma * sigma), 0.5, 30.0))
-    #     llr = np.clip(llr_raw * scale, -12.0, 12.0).astype(np.float32, copy=False)
-    #
-    #     # --- ensure length N (zero-pad if trimmed due to shift)
-    #     if llr.size != N:
-    #         out = np.zeros(N, dtype=np.float32)
-    #         m = min(llr.size, N)
-    #         out[:m] = llr[:m]
-    #         llr = out
-    #     return llr
+    def _decrypt_blob_fallback(self, blob: bytes):
+        """
+        Try both common AEAD layouts:
+          A) nonce || (ciphertext || tag)
+          B) (ciphertext || tag) || nonce
+        Return (plaintext_bytes, layout_string) on success, or (None, None).
+        """
+        # A) nonce at the front (what crypto.SecureChannel.seal() returns)
+        if len(blob) >= 12:
+            nonce_a = blob[:12]
+            body_a = blob[12:]
+            try:
+                pt = self.sec.open(blob)  # this is exactly (nonce_a || body_a)
+                return pt, "nonce-front"
+            except InvalidTag:
+                pass
 
+        # B) nonce at the end (some earlier/alt implementations)
+        if len(blob) >= 12:
+            nonce_b = blob[-12:]
+            body_b = blob[:-12]
+            try:
+                pt = self.aead.decrypt(nonce_b, body_b, None)  # same aead the SecureChannel uses
+                return pt, "nonce-tail"
+            except InvalidTag:
+                pass
 
-
+        return None, None

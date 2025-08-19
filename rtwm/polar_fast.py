@@ -5,7 +5,7 @@ CRC-aided Chase list decoding (configurable list_size; default 8).
 from __future__ import annotations
 
 import logging
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Callable
 
 import numpy as np
 from rtwm.fastpolar import PolarCode
@@ -60,7 +60,8 @@ def decode(
     list_size: int = 8,
     crc_size: int = 8,
     return_ok: bool = False,
-    debug: bool = False
+    debug: bool = False,
+    validator: Optional[Callable[[bytes], bool]] = None
 ) -> Optional[bytes] | Tuple[bytes, bool]:
     """
     Decode length-N LLRs (positive favors bit=1). On CRC pass, returns 55-byte
@@ -72,7 +73,7 @@ def decode(
     if llr.ndim != 1 or llr.size != pc.N:
         raise ValueError(f"LLR length {llr.size} != N {pc.N}")
 
-    bits, ok = pc.decode(llr)  # -> 440 info bits (uint8), ok flag
+    bits, ok = pc.decode(llr, validator=validator)  # -> 440 info bits (uint8), ok flag
 
     if debug:
         logging.debug("[DECODE] info_bits[:32]=%s ok=%s", bits[:32], ok)

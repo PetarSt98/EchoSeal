@@ -101,6 +101,14 @@ class WatermarkEmbedder:
         spread_payload = data_symbols * pn_symbols
         symbols = np.concatenate((preamble_symbols, spread_payload)).astype(np.float32, copy=False)
 
+        # Add this right after: pn_symbols = 2.0 * pn_payload.astype(np.float32) - 1.0
+        if self.frame_ctr < 3:  # Only log first few frames
+            print(f"[EMBEDDER] Frame {self.frame_ctr}")
+            print(f"  pn_payload[:32]: {pn_payload[:32]}")
+            print(f"  data_symbols[:8]: {data_symbols[:8]}")
+            print(f"  spread_payload[:8]: {spread_payload[:8]}")
+            print(f"  symbols[:8]: {symbols[:8]}")  # This is after concatenation
+
         # --- FILTER WITH PERSISTENT STATE ---
         b, a = butter_bandpass(*band, self.p.fs, order=4)
         zi_len = max(len(a), len(b)) - 1
@@ -114,11 +122,9 @@ class WatermarkEmbedder:
         self._bp_state[band] = zf
 
         # --- STEADY-STATE NORMALIZATION (avoid transient bias) ---
-        start = max(16, zi_len)  # tie to filter state length
-        steady = chips[start:] if chips.size > start else chips
-        energy = float(np.mean(steady ** 2))
-        if energy > EPS:
-            chips /= np.sqrt(energy)
+        peak_val = float(np.max(np.abs(chips))) + EPS
+        if peak_val > 3.0:  # Only scale if unreasonably large
+            chips = chips * (1.0 / peak_val)
 
         return chips.astype(np.float32, copy=False)
 

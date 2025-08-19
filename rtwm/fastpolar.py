@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import combinations
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Callable
 import numpy as np
 from rtwm.reliability_polar_bits import Q_Nmax
 
@@ -68,7 +68,7 @@ class PolarCode:
         u[self._data_pos] = data
         return self._polar_transform(u)
 
-    def decode(self, llr: np.ndarray) -> Tuple[np.ndarray, bool]:
+    def decode(self, llr: np.ndarray, validator: Optional[Callable[[bytes], bool]] = None) -> Tuple[np.ndarray, bool]:
         if llr.ndim != 1 or llr.size != self.N:
             raise ValueError(f"llr must be 1D length {self.N}")
 
@@ -81,8 +81,16 @@ class PolarCode:
         data_hat = u_hat[self._data_pos]
         info0 = data_hat[: self.K - self.crc_size]
         crc0  = data_hat[self.K - self.crc_size : self.K]
+
         if self._crc_ok(info0, crc0):
-            return info0.copy(), True
+            if validator is not None:
+                try:
+                    if validator(np.packbits(info0).tobytes()):
+                        return info0.copy(), True
+                except Exception:
+                    pass
+            else:
+                return info0.copy(), True
 
         if self.list_size == 1:
             return info0.copy(), False
@@ -104,12 +112,18 @@ class PolarCode:
                 x2 = hard.copy()
                 x2[idx] ^= 1
                 u2 = self._polar_transform(x2)
-                u2[self.frozen] = 0  # <-- NEW: enforce code constraint
+                # u2[self.frozen] = 0  # <-- NEW: enforce code constraint
                 d2 = u2[self._data_pos]
                 info2 = d2[: self.K - self.crc_size]
                 crc2  = d2[self.K - self.crc_size : self.K]
 
                 if self._crc_ok(info2, crc2):
+                    if validator is not None:
+                        try:
+                            if validator(np.packbits(info2).tobytes()):
+                                return info2.copy(), True
+                        except Exception:
+                            pass
                     if best_ok is None or metric < best_ok[0]:
                         best_ok = (metric, info2.copy())
                 else:
@@ -123,7 +137,10 @@ class PolarCode:
                 break
 
         if best_ok is not None:
-            return best_ok[1], True
+            if validator is None:
+                return best_ok[1], True
+          # validator present but none approved; treat as failure
+
         return best_any[1], False
 
     # --------------- internals ---------------

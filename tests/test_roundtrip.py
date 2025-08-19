@@ -62,6 +62,30 @@ def test_simple_watermark():
     return result_pure or result_mixed
 
 
+def test_polar_codec_only():
+    """Test polar encoding/decoding in isolation."""
+    from rtwm.polar_fast import encode as polar_enc, decode as polar_dec
+    import numpy as np
+
+    # Test with known data
+    test_payload = b"A" * 55  # 55 bytes of 'A'
+    print(f"Original payload: {test_payload[:8]}")
+
+    # Encode
+    bits = polar_enc(test_payload)
+    print(f"Encoded bits[:8]: {bits[:8]}")
+    print(f"Encoded bits[-8:]: {bits[-8:]}")
+
+    # Perfect channel (no noise)
+    llr = 2.0 * (2.0 * bits.astype(np.float32) - 1.0)  # Strong LLRs
+
+    # Decode
+    recovered = polar_dec(llr)
+    print(f"Recovered payload: {recovered[:8] if recovered else None}")
+    print(f"Polar codec test: {'PASS' if recovered == test_payload else 'FAIL'}")
+
+    assert recovered == test_payload, "Polar codec test failed!"
+
 # Also test with a much simpler signal
 def test_minimal_signal():
     """Test with minimal complexity."""
@@ -108,6 +132,103 @@ def test_tx_rx_end_to_end_minimal():
     result = rx.verify(wm, FS)
 
     assert result is True
+
+
+def test_tx_rx_silence_roundtrip():
+    """Roundtrip test with silence to confirm the system works without host signal."""
+    from rtwm.embedder import WatermarkEmbedder
+    from rtwm.detector import WatermarkDetector
+    import numpy as np
+
+    key = b"\xAA" * 32
+    FS = 48000
+    SECS = 5
+
+    np.random.seed(52)
+
+    # Use silence instead of chirp
+    silence = np.zeros(FS * SECS, dtype=np.float32)
+
+    tx = WatermarkEmbedder(key)
+    wm = tx.process(silence)
+
+    print(f"Signal power: {np.mean(silence ** 2):.6f}")
+    print(f"Watermark power: {np.mean((wm - silence) ** 2):.6f}")
+    print(f"SNR: {10 * np.log10(np.mean(silence ** 2 + 1e-12) / np.mean((wm - silence) ** 2)):.1f} dB")
+    print(f"Watermark RMS: {np.sqrt(np.mean(wm ** 2)):.6f}")
+
+    if np.array_equal(wm, silence):
+        print("WARNING: Watermark not embedded!")
+
+    rx = WatermarkDetector(key)
+    result = rx.verify(wm, FS)
+
+    assert result is True, "Silence roundtrip test failed!"
+    print("SUCCESS: Silence roundtrip test passed!")
+
+
+def test_tx_rx_very_quiet_noise_roundtrip():
+    """Roundtrip test with very quiet background noise."""
+    from rtwm.embedder import WatermarkEmbedder
+    from rtwm.detector import WatermarkDetector
+    import numpy as np
+
+    key = b"\xAA" * 32
+    FS = 48000
+    SECS = 5
+
+    np.random.seed(52)
+
+    # Very quiet white noise background
+    noise = 0.01 * np.random.randn(FS * SECS).astype(np.float32)
+    tx = WatermarkEmbedder(key)
+    wm = tx.process(noise)
+
+    print(f"Signal power: {np.mean(noise ** 2):.6f}")
+    print(f"Watermark power: {np.mean((wm - noise) ** 2):.6f}")
+    print(f"SNR: {10 * np.log10(np.mean(noise ** 2) / np.mean((wm - noise) ** 2)):.1f} dB")
+
+    if np.array_equal(wm, noise):
+        print("WARNING: Watermark not embedded!")
+
+    rx = WatermarkDetector(key)
+    result = rx.verify(wm, FS)
+
+    assert result is True, "Quiet noise roundtrip test failed!"
+    print("SUCCESS: Quiet noise roundtrip test passed!")
+
+
+def test_tx_rx_low_frequency_tone_roundtrip():
+    """Roundtrip test with low frequency tone that shouldn't interfere."""
+    from rtwm.embedder import WatermarkEmbedder
+    from rtwm.detector import WatermarkDetector
+    import numpy as np
+
+    key = b"\xAA" * 32
+    FS = 48000
+    SECS = 5
+
+    np.random.seed(52)
+
+    # 1 kHz tone at moderate level - well below watermark bands (4kHz+)
+    t = np.linspace(0, SECS, FS * SECS, endpoint=False)
+    tone = 0.1 * np.sin(2 * np.pi * 1000 * t).astype(np.float32)
+
+    tx = WatermarkEmbedder(key)
+    wm = tx.process(tone)
+
+    print(f"Signal power: {np.mean(tone ** 2):.6f}")
+    print(f"Watermark power: {np.mean((wm - tone) ** 2):.6f}")
+    print(f"SNR: {10 * np.log10(np.mean(tone ** 2) / np.mean((wm - tone) ** 2)):.1f} dB")
+
+    if np.array_equal(wm, tone):
+        print("WARNING: Watermark not embedded!")
+
+    rx = WatermarkDetector(key)
+    result = rx.verify(wm, FS)
+
+    assert result is True, "Low frequency tone roundtrip test failed!"
+    print("SUCCESS: Low frequency tone roundtrip test passed!")
 
 def test_tx_rx_end_to_end_debug():
     """Test with debug output."""

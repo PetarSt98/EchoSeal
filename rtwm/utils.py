@@ -130,3 +130,16 @@ def pn_bits(prng: StreamPRNG, frame_ctr: int, n_bits: int) -> np.ndarray:
     """
     data = prng.bytes(frame_ctr, (n_bits + 7) // 8)
     return np.unpackbits(np.frombuffer(data, dtype="u1"))[:n_bits]
+
+# utils.py
+def mseq_63() -> np.ndarray:
+    # standard 6-stage MLS (length 63), taps = [6,5], non-zero seed
+    L = 63
+    state = 0b111111  # any non-zero 6-bit seed
+    seq = np.zeros(L, dtype=np.uint8)
+    for i in range(L):
+        # taps at bits 6 and 5 => xor bit5^bit4 (0-indexed: 5 ^ 4)
+        newbit = ((state >> 5) ^ (state >> 4)) & 1
+        seq[i] = state & 1
+        state = ((state << 1) & 0b111111) | newbit
+    return seq

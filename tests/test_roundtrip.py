@@ -373,3 +373,28 @@ def test_multiple_frames():
     # Should also detect with subsections
     mid_section = wm[FS:FS * 4]  # 3 seconds from middle
     assert WatermarkDetector(key).verify(mid_section, FS) is True
+
+
+def test_basic_roundtrip():
+    """Test if basic roundtrip works after preamble fix."""
+    import numpy as np
+    from rtwm.embedder import WatermarkEmbedder
+    from rtwm.detector import WatermarkDetector
+
+    key = b"\xAA" * 32
+    FS = 48000
+    SECS = 5
+
+    # Test with noise
+    np.random.seed(42)
+    signal = 0.1 * np.random.randn(FS * SECS).astype(np.float32)
+
+    tx = WatermarkEmbedder(key)
+    wm = tx.process(signal)
+
+    rx = WatermarkDetector(key)
+    result = rx.verify(wm, FS)
+
+    assert result is True, "Basic roundtrip should work now!"
+    print("✅ Basic roundtrip WORKS!")
+    return True

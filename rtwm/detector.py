@@ -6,23 +6,17 @@ import numpy as np
 from scipy.signal import lfilter, correlate
 from cryptography.exceptions import InvalidTag
 
-from rtwm.utils       import BAND_PLAN, butter_bandpass, resample_to, choose_band
+from rtwm.utils       import BAND_PLAN, butter_bandpass, resample_to, choose_band, mseq_63
 from rtwm.crypto      import SecureChannel
 from rtwm.polar_fast  import decode as polar_dec, N_DEFAULT
 
-def mseq_63() -> np.ndarray:
-    reg = np.array([1,1,1,1,1,1], dtype=np.uint8)  # x^6 + x + 1
-    out = np.empty(63, dtype=np.uint8)
-    for i in range(63):
-        out[i] = reg[-1]
-        fb = reg[-1] ^ reg[0]
-        reg[1:] = reg[:-1]
-        reg[0] = fb
-    return out
-
 PRE_BITS   = mseq_63()
-PRE_L      = PRE_BITS.size
-FRAME_LEN  = PRE_L + N_DEFAULT
+PRE_L      = len(PRE_BITS)
+# Header: 16-bit counter (low bits) repeated 8x => 128 chips
+HDR_BITS   = 16
+HDR_REPEAT = 8
+HDR_L      = 128
+FRAME_LEN  = PRE_L + HDR_L + N_DEFAULT
 TIGHT_DELTA   = 3                                  # ±3 quick search
 WIDE_DELTA    = 200                                # one-time fallback
 EPS = 1e-12
@@ -76,6 +70,7 @@ class WatermarkDetector:
         med = float(np.median(corr))
         mad = float(np.median(np.abs(corr - med))) + 1e-12
         thr = med + 4.5 * 1.4826 * mad
+        thr = min(thr, 0.95)
         min_distance = FRAME_LEN // 2
         print(f"[SCAN] Threshold: {thr:.3f}, median: {med:.3f}, MAD: {mad:.6f}")
         peaks = []
@@ -94,7 +89,7 @@ class WatermarkDetector:
             print(f"[SCAN] First 5 peak values: {[corr[p] for p in peaks[:5]]}")
         if not peaks:
             print(f"[SCAN] No peaks above threshold, using top-K fallback")
-        # 5) Try decode at candidate starts with *time-based* counter window
+        # 5) Try decode at candidate starts using header-derived counter when possible
         tried = 0
         MAX_TRIES = 400  # overall budget per band pass (fast!)
         PEAK_LIMIT=25
@@ -105,28 +100,33 @@ class WatermarkDetector:
                 continue
             frame = y[start:start + FRAME_LEN]
 
-              # --- estimate the frame counter from time index
+            # --- fast estimate from time index (used if header fails)
             ctr_est = int(round(start / FRAME_LEN))
             cand_ctrs: list[int] = []
-            # Tight search first
 
-            for ctr in range(max(0, ctr_est - TIGHT_DELTA), ctr_est + TIGHT_DELTA + 1):
-
-                if choose_band(self._band_key, ctr) == band:
-                    cand_ctrs.append(ctr)
-              # If nothing worked, widen the window (bounded by remaining budget)
-
-            if not cand_ctrs:
+            # --- (1A) decode header to get ctr_lo16 ---
+            hdr_ok, ctr_lo16, hdr_score = self._decode_header(frame, band)
+            if hdr_ok:
                 lo = max(0, ctr_est - WIDE_DELTA)
                 hi = ctr_est + WIDE_DELTA + 1
-
                 for ctr in range(lo, hi):
-
+                    if (ctr & 0xFFFF) == ctr_lo16 and choose_band(self._band_key, ctr) == band:
+                        cand_ctrs.append(ctr)
+                print(f"  Peak@{start}: ctr_est={ctr_est}, hdr_lo16=0x{ctr_lo16:04X}, "
+                      + f"score={hdr_score:.3f}, trying {len(cand_ctrs)} counters (header gated)")
+            else:
+            # Fallback: the old time-based + band-gated window
+                for ctr in range(max(0, ctr_est - TIGHT_DELTA), ctr_est + TIGHT_DELTA + 1):
                     if choose_band(self._band_key, ctr) == band:
                         cand_ctrs.append(ctr)
-
-            print(f"  Peak@{start}: ctr_est={ctr_est}, trying {len(cand_ctrs)} counters "
-                f"(±{TIGHT_DELTA} then ±{WIDE_DELTA})")
+                if not cand_ctrs:
+                    lo = max(0, ctr_est - WIDE_DELTA)
+                    hi = ctr_est + WIDE_DELTA + 1
+                    for ctr in range(lo, hi):
+                        if choose_band(self._band_key, ctr) == band:
+                            cand_ctrs.append(ctr)
+                print(f"  Peak@{start}: ctr_est={ctr_est}, trying {len(cand_ctrs)} counters "
+                       + f"(±{TIGHT_DELTA} then ±{WIDE_DELTA})")
 
             for ctr in cand_ctrs:
                 print(f"  Trying ctr={ctr}")
@@ -144,7 +144,8 @@ class WatermarkDetector:
         print(f"[DECODE DEBUG] Frame shape: {frame.shape}")
         print(f"[DECODE DEBUG] Frame[:8]: {frame[:8]}")
         print(f"[DECODE DEBUG] Frame RMS: {np.sqrt(np.mean(frame ** 2)):.8f}")
-        llr = self._llr(frame, frame_ctr)
+        # First, default PN convention (pn over whole frame, slice payload
+        llr = self._llr(frame, frame_ctr, pn_variant=0)
         print(f"[DECODE DEBUG] LLR computed, shape: {llr.shape}")
         print(f"[DECODE DEBUG] LLR[:8]: {llr[:8]}")
         print(f"[DECODE DEBUG] LLR[-8:]: {llr[-8:]}")
@@ -164,8 +165,16 @@ class WatermarkDetector:
         print(f"    LLR[:8]: {llr[:8]}")
         print(f"    LLR[-8:]: {llr[-8:]}")
         print(f"    LLR mean: {np.mean(llr):.3f}, std: {np.std(llr):.3f}")
+
         if blob is None:
+            # Try sign flip
             blob = polar_dec(-llr, list_size=256, validator=_validator)
+        if blob is None:
+            # (3) Try alternate PN convention (restart at payload)
+            llr_alt = self._llr(frame, frame_ctr, pn_variant=1)
+            blob = polar_dec(llr_alt, list_size=256, validator=_validator)
+            if blob is None:
+                blob = polar_dec(-llr_alt, list_size=256, validator=_validator)
             if blob is None:
                 print(f"    Polar decode failed")
                 return False
@@ -264,7 +273,7 @@ class WatermarkDetector:
         self._mf_cache[key] = h
         return h
 
-    def _llr(self, frame: np.ndarray, frame_id: int) -> np.ndarray:
+    def _llr(self, frame: np.ndarray, frame_id: int, pn_variant: int = 0) -> np.ndarray:
         """
         Produce length-N LLRs for the payload. Steps:
           1) matched-filter with long cached taps,
@@ -273,14 +282,18 @@ class WatermarkDetector:
           4) robust LLR normalization.
         """
         N = N_DEFAULT
-
-        # --- PN for FULL frame (preamble + payload); we need payload part
-        pn_full = self.sec.pn_bits(frame_id, FRAME_LEN)
-        pn_payload = pn_full[PRE_L:]
+        # --- PN (payload) per selected variant
+        if pn_variant == 0:
+            # PN generated over full frame; slice the payload part (matches TX)
+            pn_full = self.sec.pn_bits(frame_id, FRAME_LEN)
+            pn_payload = pn_full[PRE_L + HDR_L:]
+        else:
+            # Alternate: PN restarted at payload length only
+            pn_payload = self.sec.pn_bits(frame_id, N_DEFAULT)
         pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0  # ±1
 
-        # --- payload segment after preamble
-        rx = frame[PRE_L:].astype(np.float32, copy=False)
+        # --- payload segment (skip preamble + header)
+        rx = frame[PRE_L + HDR_L:].astype(np.float32, copy=False)
         n = min(rx.size, pn_sy.size)
         if n <= 0:
             return np.zeros(N, dtype=np.float32)
@@ -298,7 +311,8 @@ class WatermarkDetector:
         h = self._matched_filter_taps(band)
         mf = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
         offset = len(h) - 1
-        MAX_SHIFT = 64
+        # (4) wider shift search tied to filter memory
+        MAX_SHIFT = min(n//2, 4*len(h), HDR_L//2)
         MARGIN = MAX_SHIFT
         start = max(0, offset - MARGIN)
         stop = min(mf.size, offset + n + MARGIN)
@@ -392,3 +406,62 @@ class WatermarkDetector:
                 pass
 
         return None, None
+
+
+    # ----------------------------- header decode -----------------------------
+    def _decode_header(self, frame: np.ndarray, band) -> tuple[bool, int, float]:
+        """
+        Recover 16 LSBs of frame counter from the header (16 bits, repeated 8x).
+        Returns (ok, ctr_lo16, score).
+        """
+
+        # Header chips (just after preamble)
+        seg = frame[PRE_L:PRE_L + HDR_L].astype(np.float32, copy=False)
+
+        if seg.size < HDR_L:
+            return False, 0, 0.0
+
+        # PN for header: fixed (counter-independent)
+        hdr_pn = 2.0 * self.sec.pn_bits(0, HDR_L).astype(np.float32) - 1.0
+
+        # Align using the same matched-filter taps as payload (robust to room tail)
+        h = self._matched_filter_taps(band)
+        mf = np.convolve(seg, h, mode="full").astype(np.float32, copy=False)
+        offset = len(h) - 1
+        MAX_SHIFT = min(seg.size // 2, 4 * len(h))
+        start = max(0, offset - MAX_SHIFT)
+        stop = min(mf.size, offset + seg.size + MAX_SHIFT)
+        mf_win = mf[start:stop]
+        base = offset - start
+
+        guard = int(max(8, min(32, len(h) // 8)))
+        best_s, best_score = 0, -1.0
+
+        for s in range(-MAX_SHIFT, MAX_SHIFT + 1):
+            i0, i1 = base + s, base + s + seg.size
+
+            if i0 < 0 or i1 > mf_win.size:
+                continue
+            a = mf_win[i0:i1]
+            score = float(np.mean(np.abs(a[guard:] * hdr_pn[guard:])))
+
+            if score > best_score:
+                best_score, best_s = score, s
+        i0, i1 = base + best_s, base + best_s + seg.size
+        a = mf_win[i0:i1]
+        d = a * hdr_pn
+
+        # Majority over 8-chip groups -> 16 bits (MSB-first)
+        sums = d.reshape(HDR_BITS, HDR_REPEAT).sum(axis=1)
+        bits = (sums > 0.0).astype(np.uint8)
+        margin = np.mean(np.abs(sums)) / (np.sqrt(np.mean(d*d)) + 1e-12)
+        val = 0
+
+        for b in bits:
+            val = (val << 1) | int(b)
+
+        # score proxy: normalized mean absolute per bit
+        score = float(np.mean(np.abs(sums)) / (np.std(d) + EPS))
+        ok = (np.count_nonzero(sums > 0) >= 10) and (margin > 0.5)
+
+        return ok, val, score

@@ -6,21 +6,25 @@ from dataclasses import dataclass, field
 import numpy as np, secrets
 from scipy.signal import lfilter
 import logging
-from rtwm.utils       import choose_band, butter_bandpass, db_to_lin
+from rtwm.utils import choose_band, butter_bandpass, db_to_lin, mseq_63
 from rtwm.crypto      import SecureChannel
 from rtwm.polar_fast  import encode as polar_enc, N_DEFAULT, K_DEFAULT
 
 EPS = 1e-12
 MIN_RMS_SILENCE = 1e-4   # ~ -80 dBFS; gate watermark in near-silence
 MIX_HEADROOM = 0.98
+HDR_BITS    = 16
+HDR_REPEAT  = 8
+HDR_L       = 128
 
 @dataclass(slots=True)
 class TxParams:
     fs: int = 48_000
     target_rel_db: float = -10.0
+    floor_rel_dbfs: float = -35.0
     N: int = N_DEFAULT
     K: int = K_DEFAULT
-    preamble: np.ndarray = field(default_factory=lambda: np.array([1, 0, 1] * 21, dtype=np.uint8)[:63])
+    preamble: np.ndarray = field(default_factory=lambda: mseq_63())
 
 class WatermarkEmbedder:
     def __init__(self, key32: bytes, params: TxParams | None = None) -> None:
@@ -30,18 +34,16 @@ class WatermarkEmbedder:
         self.frame_ctr = 0
         self._chip_buf: np.ndarray | None = None
         self._session_nonce = secrets.token_bytes(8)
-        self._bp_state: dict[tuple[int, int], np.ndarray] = {}
 
     # ------------------------------------------------------------------ API
     def process(self, samples: np.ndarray) -> np.ndarray:
-        """Mix one block of watermark chips into `samples` at a level tied to host RMS,
-        with silence gating and a clip-safe headroom limiter."""
+        """Mix watermark chips into `samples` at a level tied to host RMS with a
+        clip-safe headroom limiter and an absolute floor so silence still carries WM."""
         if self._chip_buf is None:
             self._chip_buf = np.empty(0, dtype=np.float32)
 
-        in_rms = float(np.sqrt(np.mean(samples.astype(np.float32, copy=False) ** 2)))
-        if in_rms < MIN_RMS_SILENCE:
-            return samples
+        x = samples.astype(np.float32, copy=False)
+        in_rms = float(np.sqrt(np.mean(x * x)) + EPS)
 
         needed = samples.size
         while self._chip_buf.size < needed:
@@ -53,21 +55,23 @@ class WatermarkEmbedder:
         chips = self._chip_buf[:needed].astype(np.float32, copy=False)
         self._chip_buf = self._chip_buf[needed:]
 
-        # Base scale proportional to host RMS and clip-safe headroom
+        # Base scale proportional to host RMS, with an absolute floor for silence
         alpha = db_to_lin(self.p.target_rel_db)
-        scale = alpha * in_rms
+        scale_host = alpha * in_rms
+        scale_floor = db_to_lin(self.p.floor_rel_dbfs)  # absolute vs. FS
+        scale = max(scale_host, scale_floor)
 
-        headroom = MIX_HEADROOM - float(np.max(np.abs(samples)))
+        headroom = MIX_HEADROOM - float(np.max(np.abs(x)))
         if headroom < 0.0:
             headroom = 0.0
         peak = float(np.max(np.abs(chips))) + EPS
         scale = min(scale, headroom / peak) if peak > 0.0 else 0.0
 
-        return samples + chips * scale
+        return x + chips * scale
 
     # ------------------------------------------------------------------ internals
     def _make_frame_chips(self) -> np.ndarray:
-        """Generate the watermark chips for one full frame with consistent filtering."""
+        """Generate watermark chips for one full frame (preamble + header + payload)."""
         # Pick a stable band key (prefer derived; fall back to legacy attr if present)
         try:
             band = choose_band(self._band_key, self.frame_ctr)
@@ -87,21 +91,29 @@ class WatermarkEmbedder:
         data_bits = polar_enc(payload, N=self.p.N, K=self.p.K)  # -> 1024 bits
 
         # --- PREAMBLE & PN SIZING (use MLS length consistently) ---
-        pre_bits = self.mseq_63()  # length 63
+        pre_bits = self.p.preamble.astype(np.uint8) # length 63
         preamble_symbols = 2.0 * pre_bits.astype(np.float32) - 1.0
 
         data_symbols = 2.0 * data_bits.astype(np.float32) - 1.0
 
-        frame_len = pre_bits.size + data_bits.size  # 63 + 1024 = 1087
-        pn_full = self.sec.pn_bits(self.frame_ctr, frame_len)  # 1087 bits
-        pn_payload = pn_full[pre_bits.size:]  # last 1024 bits
+        # ---- (1A) COUNTER-BOOTSTRAP HEADER (16 bits, each repeated 8x) ----
+        ctr_lo16 = np.uint16(self.frame_ctr & 0xFFFF)
+        ctr_bytes = np.array([ctr_lo16 >> 8, ctr_lo16 & 0xFF], dtype=np.uint8)
+        hdr_bits = np.unpackbits(ctr_bytes)  # 16 bits, MSB-first
+        hdr_bits_rep = np.repeat(hdr_bits, HDR_REPEAT)  # 16*8 = 128 bits
+        # header PN: fixed (independent of counter), derived from key
+        hdr_pn_bits = self.sec.pn_bits(0, HDR_L)
+        hdr_sy = (2.0 * hdr_bits_rep.astype(np.float32) - 1.0) * (2.0 * hdr_pn_bits.astype(np.float32) - 1.0)
+
+        frame_len = pre_bits.size + HDR_L + data_bits.size  # 63 + 128 + 1024 = 1215
+        pn_full = self.sec.pn_bits(self.frame_ctr, frame_len)  # 1215 bits
+        pn_payload = pn_full[pre_bits.size + HDR_L:]  # last 1024 bits
         pn_symbols = 2.0 * pn_payload.astype(np.float32) - 1.0
 
         # Spread payload and concatenate with unspread preamble
         spread_payload = data_symbols * pn_symbols
-        symbols = np.concatenate((preamble_symbols, spread_payload)).astype(np.float32, copy=False)
+        symbols = np.concatenate((preamble_symbols, hdr_sy, spread_payload)).astype(np.float32, copy=False)
 
-        # Add this right after: pn_symbols = 2.0 * pn_payload.astype(np.float32) - 1.0
         if self.frame_ctr < 3:  # Only log first few frames
             print(f"[EMBEDDER] Frame {self.frame_ctr}")
             print(f"  pn_payload[:32]: {pn_payload[:32]}")
@@ -109,17 +121,15 @@ class WatermarkEmbedder:
             print(f"  spread_payload[:8]: {spread_payload[:8]}")
             print(f"  symbols[:8]: {symbols[:8]}")  # This is after concatenation
 
-        # --- FILTER WITH PERSISTENT STATE ---
+        # --- (2) FILTER ALIGNMENT: zero-state at preamble; continue header+payload with that zi ---
         b, a = butter_bandpass(*band, self.p.fs, order=4)
-        zi_len = max(len(a), len(b)) - 1
-        zi = self._bp_state.get(band)
-        # ensure zi exists and has matching dtype/length
-        zi_dtype = np.result_type(a, b, symbols)
-        if zi is None or zi.shape[0] != zi_len or zi.dtype != zi_dtype:
-            zi = np.zeros(zi_len, dtype=zi_dtype)
-
-        chips, zf = lfilter(b, a, symbols, zi=zi)
-        self._bp_state[band] = zf
+        zi0_len = max(len(a), len(b)) - 1
+        zi0 = np.zeros(zi0_len, dtype=np.result_type(a, b, symbols))
+        # filter preamble from zero state
+        y_pre, zi1 = lfilter(b, a, preamble_symbols, zi=zi0)
+        # then header + payload continue from preamble's end state
+        y_rest, _ = lfilter(b, a, np.concatenate((hdr_sy, spread_payload)).astype(np.float32, copy=False), zi=zi1)
+        chips = np.concatenate((y_pre, y_rest))
 
         # --- STEADY-STATE NORMALIZATION (avoid transient bias) ---
         peak_val = float(np.max(np.abs(chips))) + EPS
@@ -144,14 +154,3 @@ class WatermarkEmbedder:
         blob = self.sec.seal(meta)
         assert len(blob) == 55
         return blob
-
-    def mseq_63(self) -> np.ndarray:
-        # x^6 + x + 1 primitive polynomial (one of the standard taps for 63)
-        reg = np.array([1, 1, 1, 1, 1, 1], dtype=np.uint8)
-        out = np.empty(63, dtype=np.uint8)
-        for i in range(63):
-            out[i] = reg[-1]
-            fb = reg[-1] ^ reg[0]  # taps at [6,1]
-            reg[1:] = reg[:-1]
-            reg[0] = fb
-        return out

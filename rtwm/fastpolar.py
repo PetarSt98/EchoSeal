@@ -17,8 +17,9 @@ def _parse_reliability_indices(N: int) -> np.ndarray:
 def _f_function(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Exact f-combine for LLR vectors (element-wise)."""
 
-    # logaddexp implements log( exp(x) + exp(y) ) in a numerically stable way.
-    return np.logaddexp(a + b, 0.0) - np.logaddexp(a, b)
+    # Our LLRs are defined as log(P(bit=1)/P(bit=0)), so the synthetic channel
+    # update for the "left" child is logaddexp(a, b) - logaddexp(0, a + b).
+    return np.logaddexp(a, b) - np.logaddexp(0.0, a + b)
 
 
 def _g_function(a: np.ndarray, b: np.ndarray, u: np.ndarray) -> np.ndarray:

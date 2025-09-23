@@ -1,6 +1,6 @@
 """
 polar_fast – thin wrapper around rtwm.fastpolar.PolarCode
-CRC-aided Chase list decoding (configurable list_size; default 8).
+CRC-aided successive-cancellation list decoding (configurable list_size; default 8).
 """
 from __future__ import annotations
 

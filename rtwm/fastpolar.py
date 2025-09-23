@@ -1,8 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from itertools import combinations
-from typing import Optional, Sequence, Tuple, Callable
+from typing import Callable, Optional, Tuple
+
 import numpy as np
+
 from rtwm.reliability_polar_bits import Q_Nmax
 
 def _parse_reliability_indices(N: int) -> np.ndarray:
@@ -12,6 +13,131 @@ def _parse_reliability_indices(N: int) -> np.ndarray:
     if np.any(rel < 0) or np.any(rel >= N) or np.unique(rel).size != N:
         raise ValueError("Q_Nmax must be a permutation of 0..N-1")
     return rel
+
+def _f_function(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Exact f-combine for LLR vectors (element-wise)."""
+
+    # logaddexp implements log( exp(x) + exp(y) ) in a numerically stable way.
+    return np.logaddexp(a + b, 0.0) - np.logaddexp(a, b)
+
+
+def _g_function(a: np.ndarray, b: np.ndarray, u: np.ndarray) -> np.ndarray:
+    """Exact g-combine for LLR vectors given left child partial sums."""
+
+    return b + (1.0 - 2.0 * u.astype(np.float64, copy=False)) * a
+
+
+def _metric_penalty(llr_scalar: float, bit: int) -> float:
+    """Return the negative log-likelihood contribution for assigning ``bit``."""
+
+    abs_llr = abs(llr_scalar)
+    penalty = float(np.log1p(np.exp(-abs_llr)))
+    preferred = 1 if llr_scalar >= 0.0 else 0
+    if bit != preferred:
+        penalty += abs_llr
+    return penalty
+
+
+class _ListPath:
+    """State container for a single path inside the SCL decoder."""
+
+    __slots__ = ("n", "N", "metric", "u", "alpha", "alpha_valid", "beta")
+
+    def __init__(self, llr: np.ndarray, n: int) -> None:
+        self.n = n
+        self.N = llr.size
+        self.metric = 0.0
+        self.u = np.zeros(self.N, dtype=np.uint8)
+
+        self.alpha = [np.zeros(self.N, dtype=np.float64) for _ in range(n + 1)]
+        self.alpha[0][:] = llr
+        self.alpha_valid = [np.zeros(1 << level, dtype=bool) for level in range(n + 1)]
+        self.alpha_valid[0][0] = True
+        self.beta = [np.zeros(self.N, dtype=np.uint8) for _ in range(n + 1)]
+
+    # ---- helpers ---------------------------------------------------------
+    def _slice(self, level: int, node: int) -> tuple[int, int]:
+        step = 1 << (self.n - level)
+        start = node * step
+        return start, start + step
+
+    # ---- path management -------------------------------------------------
+    def clone(self) -> "_ListPath":
+        child = _ListPath.__new__(_ListPath)
+        child.n = self.n
+        child.N = self.N
+        child.metric = self.metric
+        child.u = self.u.copy()
+        child.alpha = [arr.copy() for arr in self.alpha]
+        child.alpha_valid = [arr.copy() for arr in self.alpha_valid]
+        child.beta = [arr.copy() for arr in self.beta]
+        return child
+
+    # ---- message passing -------------------------------------------------
+    def calc_llr(self, bit_index: int) -> float:
+        segment = self._calc_alpha(self.n, bit_index)
+        return float(segment[0])
+
+    def _calc_alpha(self, level: int, node: int) -> np.ndarray:
+        start, end = self._slice(level, node)
+        if self.alpha_valid[level][node]:
+            return self.alpha[level][start:end]
+
+        if level == 0:
+            self.alpha_valid[0][0] = True
+            return self.alpha[0][start:end]
+
+        parent_segment = self._calc_alpha(level - 1, node // 2)
+        half = parent_segment.size // 2
+        left = parent_segment[:half]
+        right = parent_segment[half:]
+        dest = self.alpha[level][start:end]
+
+        if node % 2 == 0:
+            dest[:] = _f_function(left, right)
+        else:
+            left_start, left_end = self._slice(level, node - 1)
+            beta_left = self.beta[level][left_start:left_end]
+            dest[:] = _g_function(left, right, beta_left)
+
+        self.alpha_valid[level][node] = True
+        return dest
+
+    def extend(self, bit_index: int, bit_value: int) -> None:
+        b = np.uint8(bit_value & 1)
+        self.u[bit_index] = b
+
+        level = self.n
+        node = bit_index
+        start, end = self._slice(level, node)
+        self.beta[level][start:end] = b
+        self.alpha_valid[level][node] = False
+
+        while node % 2 == 1 and level > 0:
+            left_node = node - 1
+            parent_node = node // 2
+            level -= 1
+            parent_start, parent_end = self._slice(level, parent_node)
+            left_start, left_end = self._slice(level + 1, left_node)
+            right_start, right_end = self._slice(level + 1, node)
+
+            half = (parent_end - parent_start) // 2
+            left_bits = self.beta[level + 1][left_start:left_end]
+            right_bits = self.beta[level + 1][right_start:right_end]
+            self.beta[level][parent_start : parent_start + half] = left_bits ^ right_bits
+            self.beta[level][parent_start + half : parent_end] = right_bits
+
+            node = parent_node
+            start, end = parent_start, parent_end
+            self.alpha_valid[level][node] = False
+
+        # Invalidate ancestors on the path
+        temp_level, temp_node = level, node
+        while temp_level > 0:
+            temp_node //= 2
+            temp_level -= 1
+            self.alpha_valid[temp_level][temp_node] = False
+
 
 @dataclass(slots=True)
 class PolarCode:
@@ -26,6 +152,8 @@ class PolarCode:
     frozen: np.ndarray = field(init=False, repr=False, default=None)
     _data_pos: np.ndarray = field(init=False, repr=False, default=None)
     _u_buf: np.ndarray = field(init=False, repr=False, default=None)
+    _n: int = field(init=False, repr=False, default=0)
+    _info_len: int = field(init=False, repr=False, default=0)
 
     def __post_init__(self) -> None:
         if self.N <= 0 or (self.N & (self.N - 1)) != 0:
@@ -51,6 +179,8 @@ class PolarCode:
             raise RuntimeError("Internal error: data positions != K")
 
         self._u_buf = np.empty(self.N, dtype=np.uint8)
+        self._n = int(np.log2(self.N))
+        self._info_len = self.K - self.crc_size
 
     # --------------- API ---------------
     def encode(self, info_bits: np.ndarray) -> np.ndarray:
@@ -58,8 +188,8 @@ class PolarCode:
             info_bits = info_bits.astype(np.uint8, copy=False)
         if info_bits.ndim != 1:
             raise ValueError("info_bits must be a 1D array")
-        if info_bits.size != self.K - self.crc_size:
-            raise ValueError(f"info_bits must have length {self.K - self.crc_size}")
+        if info_bits.size != self._info_len:
+            raise ValueError(f"info_bits must have length {self._info_len}")
 
         crc = self._crc8(info_bits)
         # NOTE: concatenate then cast (dtype kwarg isn’t portable)
@@ -81,8 +211,8 @@ class PolarCode:
         u_hat = self._polar_transform(hard)
         u_hat[self.frozen] = 0
         data_hat = u_hat[self._data_pos]
-        info0 = data_hat[: self.K - self.crc_size]
-        crc0  = data_hat[self.K - self.crc_size : self.K]
+        info0 = data_hat[: self._info_len]
+        crc0 = data_hat[self._info_len : self.K]
 
         if self._crc_ok(info0, crc0):
             if validator is not None:
@@ -94,54 +224,58 @@ class PolarCode:
             else:
                 return info0.copy(), True
 
-        if self.list_size == 1:
-            return info0.copy(), False
+        paths: list[_ListPath] = [_ListPath(llr, self._n)]
 
-        # Chase: flip least-reliable codeword positions
-        order = np.argsort(np.abs(llr))                 # least reliable first
-        cand_positions = order[:min(16, self.N)]        # cap surface
-        emitted = 1
-        best_ok = None
+        for bit_index in range(self.N):
+            if self.frozen[bit_index]:
+                for path in paths:
+                    llr_val = path.calc_llr(bit_index)
+                    path.metric += _metric_penalty(llr_val, 0)
+                    path.extend(bit_index, 0)
+                continue
+
+            new_paths: list[_ListPath] = []
+            for path in paths:
+                llr_val = path.calc_llr(bit_index)
+                base_metric = path.metric
+                for bit_value in (0, 1):
+                    cand = path.clone()
+                    cand.metric = base_metric + _metric_penalty(llr_val, bit_value)
+                    cand.extend(bit_index, bit_value)
+                    new_paths.append(cand)
+
+            if not new_paths:
+                return info0.copy(), False
+
+            new_paths.sort(key=lambda p: p.metric)
+            paths = new_paths[: self.list_size]
+
+        best_crc: Optional[Tuple[float, np.ndarray]] = None
         best_any = (np.inf, info0.copy())
 
-        for r in range(1, min(5, cand_positions.size) + 1):  # up to 5-bit flips
-            for combo in combinations(cand_positions, r):
-                idx = np.fromiter(combo, dtype=np.int64)
-                metric = float(np.abs(llr[idx]).sum())
-                if best_ok is not None and metric >= best_ok[0]:
-                    continue
+        for path in sorted(paths, key=lambda p: p.metric):
+            data = path.u[self._data_pos]
+            info_bits = data[: self._info_len].copy()
+            crc_bits = data[self._info_len : self.K]
 
-                x2 = hard.copy()
-                x2[idx] ^= 1
-                u2 = self._polar_transform(x2)
-                # u2[self.frozen] = 0  # <-- NEW: enforce code constraint
-                d2 = u2[self._data_pos]
-                info2 = d2[: self.K - self.crc_size]
-                crc2  = d2[self.K - self.crc_size : self.K]
-
-                if self._crc_ok(info2, crc2):
-                    if validator is not None:
-                        try:
-                            if validator(np.packbits(info2).tobytes()):
-                                return info2.copy(), True
-                        except Exception:
-                            pass
-                    if best_ok is None or metric < best_ok[0]:
-                        best_ok = (metric, info2.copy())
+            metric = path.metric
+            if self._crc_ok(info_bits, crc_bits):
+                if validator is not None:
+                    try:
+                        if validator(np.packbits(info_bits).tobytes()):
+                            return info_bits, True
+                    except Exception:
+                        pass
                 else:
-                    if metric < best_any[0]:
-                        best_any = (metric, info2.copy())
+                    return info_bits, True
 
-                emitted += 1
-                if emitted >= self.list_size:
-                    break
-            if emitted >= self.list_size:
-                break
+                if best_crc is None or metric < best_crc[0]:
+                    best_crc = (metric, info_bits)
+            elif metric < best_any[0]:
+                best_any = (metric, info_bits)
 
-        if best_ok is not None:
-            if validator is None:
-                return best_ok[1], True
-          # validator present but none approved; treat as failure
+        if best_crc is not None:
+            return best_crc[1], False
 
         return best_any[1], False
 

@@ -1,6 +1,41 @@
-import os, numpy as np
-from rtwm.polar_fast import encode, decode, N_DEFAULT, K_DEFAULT
-from rtwm.fastpolar import PolarCode
+import importlib.util
+import os
+import sys
+import types
+from pathlib import Path
+
+import numpy as np
+
+
+def _load_rtwm_module(module: str):
+    root = Path(__file__).resolve().parents[1] / "rtwm"
+    pkg = sys.modules.get("rtwm")
+    if pkg is None:
+        pkg = types.ModuleType("rtwm")
+        pkg.__path__ = [str(root)]  # type: ignore[attr-defined]
+        sys.modules["rtwm"] = pkg
+
+    name = f"rtwm.{module}"
+    if name in sys.modules:
+        return sys.modules[name]
+
+    spec = importlib.util.spec_from_file_location(name, root / f"{module}.py")
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module {name}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+polar_fast = _load_rtwm_module("polar_fast")
+fastpolar = _load_rtwm_module("fastpolar")
+
+encode = polar_fast.encode
+decode = polar_fast.decode
+N_DEFAULT = polar_fast.N_DEFAULT
+K_DEFAULT = polar_fast.K_DEFAULT
+PolarCode = fastpolar.PolarCode
 
 def test_polar_roundtrip():
     crc_size = 8
@@ -23,6 +58,53 @@ def test_polar_roundtrip():
 
     recovered = np.packbits(decoded_bits).tobytes()
     assert recovered == payload.tobytes()
+
+
+def test_polar_awgn_roundtrip():
+    """Polar encoder/decoder should round-trip through an AWGN channel."""
+
+    rng = np.random.default_rng(1234)
+
+    pc = PolarCode(N_DEFAULT, K_DEFAULT, list_size=8, crc_size=8)
+    info_len = pc.K - pc.crc_size
+    info_bits = rng.integers(0, 2, info_len, dtype=np.uint8)
+
+    codeword = pc.encode(info_bits)
+    assert codeword.shape == (pc.N,)
+
+    sigma = 0.15
+    tx = 2.0 * codeword.astype(np.float64) - 1.0
+    noise = rng.normal(0.0, sigma, size=tx.size)
+    rx = tx + noise
+    llr = 2.0 * rx / (sigma**2)
+
+    decoded_bits, ok = pc.decode(llr)
+
+    assert ok is True
+    assert decoded_bits.shape == (info_len,)
+    np.testing.assert_array_equal(decoded_bits, info_bits)
+
+
+def test_polar_fast_wrapper_awgn_roundtrip():
+    """The polar_fast convenience wrappers should also survive AWGN."""
+
+    rng = np.random.default_rng(4321)
+
+    payload = rng.integers(0, 256, size=(K_DEFAULT - 8) // 8, dtype=np.uint8).tobytes()
+
+    codeword = encode(payload)
+    assert codeword.shape == (N_DEFAULT,)
+
+    sigma = 0.15
+    tx = 2.0 * codeword.astype(np.float64) - 1.0
+    noise = rng.normal(0.0, sigma, size=tx.size)
+    rx = tx + noise
+    llr = 2.0 * rx / (sigma**2)
+
+    recovered, ok = decode(llr, return_ok=True)
+
+    assert ok is True
+    assert recovered == payload
 
 def test_crc8():
     pc = PolarCode(1024, 448)

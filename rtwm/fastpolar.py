@@ -219,9 +219,9 @@ class PolarCode:
         # _crc_poly already declared with default; keep as 0x07
         rel = _parse_reliability_indices(self.N)
 
-        # frozen mask (True=frozen), unfreeze the K *most* reliable bit-channels
-        # The 5G Q_Nmax sequence lists channels from most → least reliable, so
-        # we take the first K entries as the information set.
+        # frozen mask (True=frozen). ``Q_Nmax`` follows the 5G NR convention
+        # where indices are sorted from most → least reliable, so the first
+        # ``K`` entries form the information set.
         self.frozen = np.ones(self.N, dtype=bool)
         self.frozen[rel[: self.K]] = False
 

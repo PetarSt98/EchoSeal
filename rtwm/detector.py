@@ -23,12 +23,14 @@ EPS = 1e-12
 
 class WatermarkDetector:
     """Recover EchoSeal watermark from ≥3 s recording."""
-    def __init__(self, key32: bytes, *, fs_target: int = 48_000) -> None:
+
+    def __init__(self, key32: bytes, *, fs_target: int = 48_000, list_size: int = 256) -> None:
         self.sec          = SecureChannel(key32)
         self.fs_target    = fs_target
         self.session_nonce: bytes | None = None     # 8-byte anti-replay
         self._band_key = getattr(self.sec, "band_key", key32)
         self._mf_cache = {}
+        self._list_size = int(list_size)
 
     # ------------------------------------------------------------------ API
     def verify(self, audio: np.ndarray, fs_in: int) -> bool:
@@ -161,20 +163,20 @@ class WatermarkDetector:
                 return False
             return int.from_bytes(pt[4:8], "big") == frame_ctr
 
-        blob = polar_dec(llr, list_size=256, validator=_validator)
+        blob = polar_dec(llr, list_size=self._list_size, validator=_validator)
         print(f"    LLR[:8]: {llr[:8]}")
         print(f"    LLR[-8:]: {llr[-8:]}")
         print(f"    LLR mean: {np.mean(llr):.3f}, std: {np.std(llr):.3f}")
 
         if blob is None:
             # Try sign flip
-            blob = polar_dec(-llr, list_size=256, validator=_validator)
+            blob = polar_dec(-llr, list_size=self._list_size, validator=_validator)
         if blob is None:
             # (3) Try alternate PN convention (restart at payload)
             llr_alt = self._llr(frame, frame_ctr, pn_variant=1)
-            blob = polar_dec(llr_alt, list_size=256, validator=_validator)
+            blob = polar_dec(llr_alt, list_size=self._list_size, validator=_validator)
             if blob is None:
-                blob = polar_dec(-llr_alt, list_size=256, validator=_validator)
+                blob = polar_dec(-llr_alt, list_size=self._list_size, validator=_validator)
             if blob is None:
                 print(f"    Polar decode failed")
                 return False

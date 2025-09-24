@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple
 
@@ -39,6 +40,22 @@ def _metric_penalty(llr_scalar: float, bit: int) -> float:
     return penalty
 
 
+class _SharedArray:
+    __slots__ = ("arr", "refcount")
+
+    def __init__(self, arr: np.ndarray) -> None:
+        self.arr = arr
+        self.refcount = 1
+
+    def acquire(self) -> None:
+        self.refcount += 1
+
+    def release(self) -> None:
+        self.refcount -= 1
+        if self.refcount < 0:
+            raise RuntimeError("Shared array released too many times")
+
+
 class _ListPath:
     """State container for a single path inside the SCL decoder."""
 
@@ -50,17 +67,45 @@ class _ListPath:
         self.metric = 0.0
         self.u = np.zeros(self.N, dtype=np.uint8)
 
-        self.alpha = [np.zeros(self.N, dtype=np.float64) for _ in range(n + 1)]
-        self.alpha[0][:] = llr
+        self.alpha = [_SharedArray(np.zeros(self.N, dtype=np.float64)) for _ in range(n + 1)]
+        self.alpha[0].arr[:] = llr
         self.alpha_valid = [np.zeros(1 << level, dtype=bool) for level in range(n + 1)]
         self.alpha_valid[0][0] = True
-        self.beta = [np.zeros(self.N, dtype=np.uint8) for _ in range(n + 1)]
+        self.beta = [_SharedArray(np.zeros(self.N, dtype=np.uint8)) for _ in range(n + 1)]
 
     # ---- helpers ---------------------------------------------------------
     def _slice(self, level: int, node: int) -> tuple[int, int]:
         step = 1 << (self.n - level)
         start = node * step
         return start, start + step
+
+    def _alpha_ro(self, level: int) -> np.ndarray:
+        return self.alpha[level].arr
+
+    def _alpha_rw(self, level: int) -> np.ndarray:
+        shared = self.alpha[level]
+        if shared.refcount > 1:
+            shared.release()
+            shared = _SharedArray(shared.arr.copy())
+            self.alpha[level] = shared
+        return shared.arr
+
+    def _beta_ro(self, level: int) -> np.ndarray:
+        return self.beta[level].arr
+
+    def _beta_rw(self, level: int) -> np.ndarray:
+        shared = self.beta[level]
+        if shared.refcount > 1:
+            shared.release()
+            shared = _SharedArray(shared.arr.copy())
+            self.beta[level] = shared
+        return shared.arr
+
+    def release(self) -> None:
+        for shared in self.alpha:
+            shared.release()
+        for shared in self.beta:
+            shared.release()
 
     # ---- path management -------------------------------------------------
     def clone(self) -> "_ListPath":
@@ -69,9 +114,13 @@ class _ListPath:
         child.N = self.N
         child.metric = self.metric
         child.u = self.u.copy()
-        child.alpha = [arr.copy() for arr in self.alpha]
+        child.alpha = [shared for shared in self.alpha]
+        for shared in child.alpha:
+            shared.acquire()
         child.alpha_valid = [arr.copy() for arr in self.alpha_valid]
-        child.beta = [arr.copy() for arr in self.beta]
+        child.beta = [shared for shared in self.beta]
+        for shared in child.beta:
+            shared.acquire()
         return child
 
     # ---- message passing -------------------------------------------------
@@ -82,23 +131,23 @@ class _ListPath:
     def _calc_alpha(self, level: int, node: int) -> np.ndarray:
         start, end = self._slice(level, node)
         if self.alpha_valid[level][node]:
-            return self.alpha[level][start:end]
+            return self._alpha_ro(level)[start:end]
 
         if level == 0:
             self.alpha_valid[0][0] = True
-            return self.alpha[0][start:end]
+            return self._alpha_ro(0)[start:end]
 
         parent_segment = self._calc_alpha(level - 1, node // 2)
         half = parent_segment.size // 2
         left = parent_segment[:half]
         right = parent_segment[half:]
-        dest = self.alpha[level][start:end]
+        dest = self._alpha_rw(level)[start:end]
 
         if node % 2 == 0:
             dest[:] = _f_function(left, right)
         else:
             left_start, left_end = self._slice(level, node - 1)
-            beta_left = self.beta[level][left_start:left_end]
+            beta_left = self._beta_ro(level)[left_start:left_end]
             dest[:] = _g_function(left, right, beta_left)
 
         self.alpha_valid[level][node] = True
@@ -111,7 +160,7 @@ class _ListPath:
         level = self.n
         node = bit_index
         start, end = self._slice(level, node)
-        self.beta[level][start:end] = b
+        self._beta_rw(level)[start:end] = b
         self.alpha_valid[level][node] = False
 
         while node % 2 == 1 and level > 0:
@@ -123,10 +172,11 @@ class _ListPath:
             right_start, right_end = self._slice(level + 1, node)
 
             half = (parent_end - parent_start) // 2
-            left_bits = self.beta[level + 1][left_start:left_end]
-            right_bits = self.beta[level + 1][right_start:right_end]
-            self.beta[level][parent_start : parent_start + half] = left_bits ^ right_bits
-            self.beta[level][parent_start + half : parent_end] = right_bits
+            left_bits = self._beta_ro(level + 1)[left_start:left_end]
+            right_bits = self._beta_ro(level + 1)[right_start:right_end]
+            parent_beta = self._beta_rw(level)
+            parent_beta[parent_start : parent_start + half] = left_bits ^ right_bits
+            parent_beta[parent_start + half : parent_end] = right_bits
 
             node = parent_node
             start, end = parent_start, parent_end
@@ -235,21 +285,49 @@ class PolarCode:
                     path.extend(bit_index, 0)
                 continue
 
-            new_paths: list[_ListPath] = []
-            for path in paths:
+            candidates: list[tuple[float, int, int]] = []
+            for idx, path in enumerate(paths):
                 llr_val = path.calc_llr(bit_index)
                 base_metric = path.metric
-                for bit_value in (0, 1):
-                    cand = path.clone()
-                    cand.metric = base_metric + _metric_penalty(llr_val, bit_value)
-                    cand.extend(bit_index, bit_value)
-                    new_paths.append(cand)
+                candidates.append((base_metric + _metric_penalty(llr_val, 0), idx, 0))
+                candidates.append((base_metric + _metric_penalty(llr_val, 1), idx, 1))
 
-            if not new_paths:
+            if not candidates:
                 return info0.copy(), False
 
-            new_paths.sort(key=lambda p: p.metric)
-            paths = new_paths[: self.list_size]
+            candidates.sort(key=lambda item: item[0])
+            survivors = candidates[: self.list_size]
+
+            clone_budget: dict[int, int] = defaultdict(int)
+            for _, idx, _ in survivors:
+                clone_budget[idx] += 1
+
+            survivor_indices = set(clone_budget)
+
+            cloned: dict[int, list[_ListPath]] = {}
+            for idx, count in clone_budget.items():
+                if count > 1:
+                    base_path = paths[idx]
+                    # Pre-create clones so we preserve the original for one survivor
+                    cloned[idx] = [base_path.clone() for _ in range(count - 1)]
+
+            used_primary: dict[int, bool] = {idx: False for idx in clone_budget}
+            new_paths: list[_ListPath] = []
+            for metric, idx, bit_value in survivors:
+                if not used_primary[idx]:
+                    path = paths[idx]
+                    used_primary[idx] = True
+                else:
+                    path = cloned[idx].pop()
+                path.metric = metric
+                path.extend(bit_index, bit_value)
+                new_paths.append(path)
+
+            for old_idx, path in enumerate(paths):
+                if old_idx not in survivor_indices:
+                    path.release()
+
+            paths = new_paths
 
         best_crc: Optional[Tuple[float, np.ndarray]] = None
         best_any = (np.inf, info0.copy())

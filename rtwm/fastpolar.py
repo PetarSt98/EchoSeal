@@ -220,10 +220,10 @@ class PolarCode:
         rel = _parse_reliability_indices(self.N)
 
         # frozen mask (True=frozen). ``Q_Nmax`` follows the 5G NR convention
-        # where the entries appear from least → most reliable, so take the
-        # *last* ``K`` positions as the unfrozen information set.
+        # where indices are sorted from most → least reliable, so the first
+        # ``K`` entries form the information set.
         self.frozen = np.ones(self.N, dtype=bool)
-        self.frozen[rel[-self.K :]] = False
+        self.frozen[rel[: self.K]] = False
 
         self._data_pos = np.flatnonzero(~self.frozen)
         if self._data_pos.size != self.K:

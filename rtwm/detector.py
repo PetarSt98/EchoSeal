@@ -314,7 +314,15 @@ class WatermarkDetector:
         mf = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
         offset = len(h) - 1
         # (4) wider shift search tied to filter memory
-        MAX_SHIFT = min(n//2, 4*len(h), HDR_L//2)
+        # Allow the matched-filter alignment to search across the full filter tail
+        # (which can easily exceed the 64-chip header repeat).  Some hop bands have
+        # long group delays, and the previous cap of HDR_L//2 (=64) truncated the
+        # search range, forcing the detector to lock onto an incorrect alignment
+        # and producing near-random LLRs.  Expand the window to cover either four
+        # impulse-response lengths or the header length, whichever is larger, while
+        # still bounding by half the payload size so runtime remains manageable.
+        max_search = max(4 * len(h), HDR_L)
+        MAX_SHIFT = min(n // 2, max_search)
         MARGIN = MAX_SHIFT
         start = max(0, offset - MARGIN)
         stop = min(mf.size, offset + n + MARGIN)

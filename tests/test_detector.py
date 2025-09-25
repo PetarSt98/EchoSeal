@@ -1,8 +1,9 @@
 import numpy as np
+from scipy.signal   import lfilter
 from rtwm.embedder  import WatermarkEmbedder
 from rtwm.detector  import WatermarkDetector
 from rtwm.crypto    import SecureChannel
-from rtwm.utils     import choose_band
+from rtwm.utils     import choose_band, butter_bandpass
 
 # We want to feed the detector *exactly* what it expects.
 FS   = 48_000
@@ -73,3 +74,30 @@ def test_pn_sign_convention():
     print("mean(despread) =", mean_sign)
     # For random data we expect mean ≈ 0.  If it's ≈ +1 or −1, the sign is off.
     assert abs(mean_sign) < 0.2, "PN despreading sign looks wrong"
+
+
+def test_matched_filter_captures_tx_channel():
+    """Detector matched-filter taps must include the TX filter response."""
+    det = WatermarkDetector(KEY)
+    band = choose_band(KEY, 0)
+    b, a = butter_bandpass(*band, FS, order=4)
+
+    # Reference cascade impulse: TX filter (b, a) applied twice.
+    imp = np.zeros(512, dtype=np.float32)
+    imp[0] = 1.0
+    g = lfilter(b, a, imp)
+    cascade = np.convolve(g, g, mode="full")
+
+    e = cascade * cascade
+    cumulative = np.cumsum(e)
+    total = cumulative[-1]
+    idx = np.searchsorted(cumulative, 0.999 * total)
+    cascade = cascade[:idx + 1]
+
+    h_expected = cascade[::-1]
+    h_expected /= np.sqrt(np.sum(h_expected * h_expected))
+
+    h_actual = det._matched_filter_taps(band)
+
+    assert h_actual.shape == h_expected.shape
+    np.testing.assert_allclose(h_actual, h_expected, rtol=1e-6, atol=1e-6)

@@ -256,19 +256,27 @@ class WatermarkDetector:
         # (at 48 kHz this is ≳5 ms, enough for a 4th-order BPF tail)
         M = max(256, M_base * 64)
 
-        imp = np.zeros(M, dtype=np.float32);
+        imp = np.zeros(M, dtype=np.float32)
         imp[0] = 1.0
-        g = lfilter(b, a, imp).astype(np.float32)
+        g_rx = lfilter(b, a, imp).astype(np.float32)
 
-        # --- truncate by energy: keep 99.9% of the impulse energy ---
-        e = g * g
+        # The embedder already band-pass filters the chips with the same IIR.
+        # After we filter the recording once more (`g_rx`), the effective
+        # channel seen by the payload chips is the cascade g_tx ⋆ g_rx.
+        # A proper matched filter must therefore include the transmit filter
+        # as well; otherwise we would leave the asymmetric TX impulse response
+        # in place, which creates significant ISI in the despread sequence.
+        g_tx_rx = np.convolve(g_rx, g_rx, mode="full")
+
+        # --- truncate by energy: keep 99.9% of the cascade energy ---
+        e = g_tx_rx * g_tx_rx
         c = np.cumsum(e)
         total = float(c[-1]) + 1e-20
         idx = int(np.searchsorted(c, 0.999 * total))  # 99.9%
-        g = g[:idx + 1] if idx + 1 < g.size else g
+        g_tx_rx = g_tx_rx[:idx + 1] if idx + 1 < g_tx_rx.size else g_tx_rx
 
-        # Matched filter is time-reverse of g
-        h = g[::-1]
+        # Matched filter is time-reverse of the overall channel response
+        h = g_tx_rx[::-1]
         # Unit-energy normalize
         h /= (np.sqrt(float(np.sum(h * h))) + 1e-12)
 
@@ -295,30 +303,31 @@ class WatermarkDetector:
         pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0  # ±1
 
         # --- payload segment (skip preamble + header)
-        rx = frame[PRE_L + HDR_L:].astype(np.float32, copy=False)
-        n = min(rx.size, pn_sy.size)
+        rx = frame.astype(np.float32, copy=False)
+        payload = rx[PRE_L + HDR_L:]
+        n = min(payload.size, pn_sy.size)
         if n <= 0:
             return np.zeros(N, dtype=np.float32)
-        rx = rx[:n]
+        payload = payload[:n]
         pn_sy = pn_sy[:n]
 
         # Add this right after: pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0
         print(f"[DETECTOR] Frame {frame_id}")
         print(f"  pn_payload[:32]: {pn_payload[:32]}")
-        print(f"  rx[:8]: {rx[:8]}")
-        print(f"  despread[:8] (before shift search): {(rx[:8] * pn_sy[:8])}")
+        print(f"  rx[:8]: {payload[:8]}")
+        print(f"  despread[:8] (before shift search): {(payload[:8] * pn_sy[:8])}")
 
         # --- matched filter (long, truncated to ~99.9% energy)
         band = choose_band(self._band_key, frame_id)
         h = self._matched_filter_taps(band)
-        mf = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
-        offset = len(h) - 1
+        mf_full = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
+        offset = len(h) - 1 + PRE_L + HDR_L
         # (4) wider shift search tied to filter memory
         MAX_SHIFT = min(n//2, 4*len(h), HDR_L//2)
         MARGIN = MAX_SHIFT
         start = max(0, offset - MARGIN)
-        stop = min(mf.size, offset + n + MARGIN)
-        mf_win = mf[start:stop]
+        stop = min(mf_full.size, offset + n + MARGIN)
+        mf_win = mf_full[start:stop]
         base = offset - start  # zero-shift index within mf_win
 
 
@@ -351,7 +360,7 @@ class WatermarkDetector:
 
         # --- after picking best_s, before building despread ---
         print(f"[LLR ALIGN] best_s={best_s}, n={n}, len(h)={len(h)}, "
-              f"mf_total={mf.size}, fixed_slice=[{offset}:{offset + n}] ")
+              f"mf_total={mf_full.size}, fixed_slice=[{offset}:{offset + n}] ")
 
         # Keep existing code that forms 'despread'...
         print(f"[LLR ALIGN] aligned_len={despread.size}, guard={guard}")

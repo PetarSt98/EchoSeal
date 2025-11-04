@@ -60,7 +60,11 @@ class WatermarkDetector:
         y = lfilter(b, a, signal.astype(np.float32, copy=False))
 
         # 2) Filtered preamble template (zero-state), unit-normalize
-        tpl = lfilter(b, a, self._pre_sy)
+        # The embedder already band-pass filters the watermark, and we apply the
+        # same filter again during detection. Build a template that matches the
+        # cascaded response so correlation scores line up with the received
+        # waveform.
+        tpl = lfilter(b, a, lfilter(b, a, self._pre_sy))
         tpl_norm = float(np.sqrt(np.sum(tpl * tpl)) + 1e-12)
         tpl = tpl / tpl_norm
 
@@ -267,19 +271,22 @@ class WatermarkDetector:
         # (at 48 kHz this is ≳5 ms, enough for a 4th-order BPF tail)
         M = max(256, M_base * 64)
 
-        imp = np.zeros(M, dtype=np.float32);
+        imp = np.zeros(M, dtype=np.float32)
         imp[0] = 1.0
-        g = lfilter(b, a, imp).astype(np.float32)
+        g_tx = lfilter(b, a, imp).astype(np.float32)
+        # Detector applies the same band-pass before matched filtering, so the
+        # effective channel is the cascade of TX+RX filters.
+        g_eff = np.convolve(g_tx, g_tx).astype(np.float32)
 
         # --- truncate by energy: keep 99.9% of the impulse energy ---
-        e = g * g
+        e = g_eff * g_eff
         c = np.cumsum(e)
         total = float(c[-1]) + 1e-20
         idx = int(np.searchsorted(c, 0.999 * total))  # 99.9%
-        g = g[:idx + 1] if idx + 1 < g.size else g
+        g_eff = g_eff[:idx + 1] if idx + 1 < g_eff.size else g_eff
 
-        # Matched filter is time-reverse of g
-        h = g[::-1]
+        # Matched filter is time-reverse of g_eff
+        h = g_eff[::-1]
         # Unit-energy normalize
         h /= (np.sqrt(float(np.sum(h * h))) + 1e-12)
 
@@ -456,9 +463,16 @@ class WatermarkDetector:
 
         # Align using the same matched-filter taps as payload (robust to room tail)
         h = self._matched_filter_taps(band)
-        mf = np.convolve(seg, h, mode="full").astype(np.float32, copy=False)
-        offset = len(h) - 1
-        MAX_SHIFT = min(seg.size // 2, 4 * len(h))
+        prefix_len = min(len(h) - 1, PRE_L)
+        if prefix_len > 0:
+            prefix = frame[PRE_L - prefix_len:PRE_L].astype(np.float32, copy=False)
+            seg_full = np.concatenate((prefix, seg))
+        else:
+            seg_full = seg
+
+        mf = np.convolve(seg_full, h, mode="full").astype(np.float32, copy=False)
+        offset = (len(h) - 1) + prefix_len
+        MAX_SHIFT = min(seg.size // 2 + prefix_len, 4 * len(h))
         mem = len(h) - 1
         if MAX_SHIFT < mem:
             MAX_SHIFT = mem
@@ -476,7 +490,8 @@ class WatermarkDetector:
             if i0 < 0 or i1 > mf_win.size:
                 continue
             a = mf_win[i0:i1]
-            score = float(np.mean(np.abs(a[guard:] * self._hdr_pn_sy[guard:])))
+            corr = float(np.sum(a[guard:] * self._hdr_pn_sy[guard:]))
+            score = abs(corr)
 
             if score > best_score:
                 best_score, best_s = score, s
@@ -486,7 +501,7 @@ class WatermarkDetector:
 
         # Majority over 8-chip groups -> 16 bits (MSB-first)
         sums = d.reshape(HDR_BITS, HDR_REPEAT).sum(axis=1)
-        bits = (sums > 0.0).astype(np.uint8)
+        bits = (sums < 0.0).astype(np.uint8)
         margin = np.mean(np.abs(sums)) / (np.sqrt(np.mean(d*d)) + 1e-12)
         val = 0
 

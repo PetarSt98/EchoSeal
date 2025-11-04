@@ -31,6 +31,7 @@ class WatermarkDetector:
         self._band_key = getattr(self.sec, "band_key", key32)
         self._mf_cache = {}
         self._list_size = int(list_size)
+        self._aead = getattr(self.sec, "_aead", None)
 
     # ------------------------------------------------------------------ API
     def verify(self, audio: np.ndarray, fs_in: int) -> bool:
@@ -188,7 +189,11 @@ class WatermarkDetector:
             print(f"    Crypto OK, plain len: {len(plain)}; "
                   f"magic={plain[:4]!r}, ctr={int.from_bytes(plain[4:8], 'big')}")
         except Exception  as e:
-            if len(blob) >= 4 and blob[:4] == b"ESAL":
+            fallback_plain, layout = self._decrypt_blob_fallback(blob)
+            if fallback_plain is not None:
+                plain = fallback_plain
+                print(f"    Crypto OK via fallback layout '{layout}', plain len: {len(plain)}")
+            elif len(blob) >= 4 and blob[:4] == b"ESAL":
                 plain = blob
                 print("    Crypto skipped: payload appears to be PLAINTEXT (legacy mode)")
             else:
@@ -404,12 +409,15 @@ class WatermarkDetector:
           B) (ciphertext || tag) || nonce
         Return (plaintext_bytes, layout_string) on success, or (None, None).
         """
+        if self._aead is None:
+            return None, None
+
         # A) nonce at the front (what crypto.SecureChannel.seal() returns)
         if len(blob) >= 12:
             nonce_a = blob[:12]
             body_a = blob[12:]
             try:
-                pt = self.sec.open(blob)  # this is exactly (nonce_a || body_a)
+                pt = self._aead.decrypt(nonce_a, body_a, b"")
                 return pt, "nonce-front"
             except InvalidTag:
                 pass
@@ -419,7 +427,7 @@ class WatermarkDetector:
             nonce_b = blob[-12:]
             body_b = blob[:-12]
             try:
-                pt = self.aead.decrypt(nonce_b, body_b, None)  # same aead the SecureChannel uses
+                pt = self._aead.decrypt(nonce_b, body_b, b"")
                 return pt, "nonce-tail"
             except InvalidTag:
                 pass

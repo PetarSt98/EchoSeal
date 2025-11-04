@@ -295,26 +295,43 @@ class WatermarkDetector:
         pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0  # ±1
 
         # --- payload segment (skip preamble + header)
-        rx = frame[PRE_L + HDR_L:].astype(np.float32, copy=False)
-        n = min(rx.size, pn_sy.size)
-        if n <= 0:
-            return np.zeros(N, dtype=np.float32)
-        rx = rx[:n]
-        pn_sy = pn_sy[:n]
-
-        # Add this right after: pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0
-        print(f"[DETECTOR] Frame {frame_id}")
-        print(f"  pn_payload[:32]: {pn_payload[:32]}")
-        print(f"  rx[:8]: {rx[:8]}")
-        print(f"  despread[:8] (before shift search): {(rx[:8] * pn_sy[:8])}")
-
-        # --- matched filter (long, truncated to ~99.9% energy)
         band = choose_band(self._band_key, frame_id)
         h = self._matched_filter_taps(band)
-        mf = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
-        offset = len(h) - 1
+        mem = len(h) - 1
+        payload_start = PRE_L + HDR_L
+        if payload_start >= frame.size:
+            return np.zeros(N, dtype=np.float32)
+
+        rx_payload = frame[payload_start:].astype(np.float32, copy=False)
+        if rx_payload.size == 0:
+            return np.zeros(N, dtype=np.float32)
+
+        prefix_len = min(mem, payload_start)
+        if prefix_len > 0:
+            prefix = frame[payload_start - prefix_len:payload_start].astype(np.float32, copy=False)
+            rx_full = np.concatenate([prefix, rx_payload])
+        else:
+            rx_full = rx_payload
+
+        mf = np.convolve(rx_full, h, mode="full").astype(np.float32, copy=False)
+        offset = prefix_len + mem
+
+        n = min(pn_sy.size, rx_payload.size)
+        if n <= 0:
+            return np.zeros(N, dtype=np.float32)
+
+        pn_sy = pn_sy[:n]
+        rx_payload = rx_payload[:n]
+
+        print(f"[DETECTOR] Frame {frame_id}")
+        print(f"  pn_payload[:32]: {pn_payload[:32]}")
+        print(f"  rx[:8]: {rx_payload[:8]}")
+        print(f"  despread[:8] (before shift search): {(rx_payload[:8] * pn_sy[:8])}")
+
+        # --- matched filter (long, truncated to ~99.9% energy)
         # (4) wider shift search tied to filter memory
-        MAX_SHIFT = min(n//2, 4*len(h), HDR_L//2)
+        raw_shift = min(n // 2, 4 * len(h), HDR_L)
+        MAX_SHIFT = max(mem, raw_shift)
         MARGIN = MAX_SHIFT
         start = max(0, offset - MARGIN)
         stop = min(mf.size, offset + n + MARGIN)
@@ -323,7 +340,7 @@ class WatermarkDetector:
 
 
         # --- guard region to avoid preamble tail bias
-        guard = int(max(16, min(64, len(h) // 8)))
+        guard = int(min(n // 4, max(len(h) // 2, 24)))
         if guard >= n:
             guard = max(0, n // 4)
 
@@ -431,6 +448,9 @@ class WatermarkDetector:
         mf = np.convolve(seg, h, mode="full").astype(np.float32, copy=False)
         offset = len(h) - 1
         MAX_SHIFT = min(seg.size // 2, 4 * len(h))
+        mem = len(h) - 1
+        if MAX_SHIFT < mem:
+            MAX_SHIFT = mem
         start = max(0, offset - MAX_SHIFT)
         stop = min(mf.size, offset + seg.size + MAX_SHIFT)
         mf_win = mf[start:stop]

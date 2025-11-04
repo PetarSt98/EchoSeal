@@ -34,6 +34,11 @@ class WatermarkEmbedder:
         self.frame_ctr = 0
         self._chip_buf: np.ndarray | None = None
         self._session_nonce = secrets.token_bytes(8)
+        # Pre-compute the static sequences we reuse every frame so there is no
+        # chance of drifting from the detector's expectations.
+        self._preamble_sy = 2.0 * self.p.preamble.astype(np.float32) - 1.0
+        # Header PN never depends on the frame counter; cache the ±1 symbols.
+        self._hdr_pn_sy = 2.0 * self.sec.pn_bits(0, HDR_L).astype(np.float32) - 1.0
 
     # ------------------------------------------------------------------ API
     def process(self, samples: np.ndarray) -> np.ndarray:
@@ -92,7 +97,7 @@ class WatermarkEmbedder:
 
         # --- PREAMBLE & PN SIZING (use MLS length consistently) ---
         pre_bits = self.p.preamble.astype(np.uint8) # length 63
-        preamble_symbols = 2.0 * pre_bits.astype(np.float32) - 1.0
+        preamble_symbols = self._preamble_sy
 
         data_symbols = 2.0 * data_bits.astype(np.float32) - 1.0
 
@@ -101,18 +106,25 @@ class WatermarkEmbedder:
         ctr_bytes = np.array([ctr_lo16 >> 8, ctr_lo16 & 0xFF], dtype=np.uint8)
         hdr_bits = np.unpackbits(ctr_bytes)  # 16 bits, MSB-first
         hdr_bits_rep = np.repeat(hdr_bits, HDR_REPEAT)  # 16*8 = 128 bits
-        # header PN: fixed (independent of counter), derived from key
-        hdr_pn_bits = self.sec.pn_bits(0, HDR_L)
-        hdr_sy = (2.0 * hdr_bits_rep.astype(np.float32) - 1.0) * (2.0 * hdr_pn_bits.astype(np.float32) - 1.0)
+        hdr_bpsk = 2.0 * hdr_bits_rep.astype(np.float32) - 1.0
+        hdr_sy = hdr_bpsk * self._hdr_pn_sy
 
         frame_len = pre_bits.size + HDR_L + data_bits.size  # 63 + 128 + 1024 = 1215
         pn_full = self.sec.pn_bits(self.frame_ctr, frame_len)  # 1215 bits
         pn_payload = pn_full[pre_bits.size + HDR_L:]  # last 1024 bits
+        if pn_payload.size != data_bits.size:
+            raise RuntimeError(
+                f"PN payload length {pn_payload.size} != encoded payload {data_bits.size}"
+            )
         pn_symbols = 2.0 * pn_payload.astype(np.float32) - 1.0
 
         # Spread payload and concatenate with unspread preamble
         spread_payload = data_symbols * pn_symbols
         symbols = np.concatenate((preamble_symbols, hdr_sy, spread_payload)).astype(np.float32, copy=False)
+        if symbols.size != frame_len:
+            raise RuntimeError(
+                f"Frame assembled to {symbols.size} chips, expected {frame_len}"
+            )
 
         if self.frame_ctr < 3:  # Only log first few frames
             print(f"[EMBEDDER] Frame {self.frame_ctr}")

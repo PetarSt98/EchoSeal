@@ -32,6 +32,13 @@ class WatermarkDetector:
         self._mf_cache = {}
         self._list_size = int(list_size)
         self._aead = getattr(self.sec, "_aead", None)
+        # Cache the static symbol sequences so detector & embedder stay aligned.
+        self._pre_sy = 2.0 * PRE_BITS.astype(np.float32) - 1.0
+        self._hdr_pn_sy = 2.0 * self.sec.pn_bits(0, HDR_L).astype(np.float32) - 1.0
+        if self._hdr_pn_sy.size != HDR_L:
+            raise RuntimeError(
+                f"Header PN length {self._hdr_pn_sy.size} != expected {HDR_L}"
+            )
 
     # ------------------------------------------------------------------ API
     def verify(self, audio: np.ndarray, fs_in: int) -> bool:
@@ -53,8 +60,7 @@ class WatermarkDetector:
         y = lfilter(b, a, signal.astype(np.float32, copy=False))
 
         # 2) Filtered preamble template (zero-state), unit-normalize
-        pre_sy = 2.0 * PRE_BITS.astype(np.float32) - 1.0
-        tpl = lfilter(b, a, pre_sy)
+        tpl = lfilter(b, a, self._pre_sy)
         tpl_norm = float(np.sqrt(np.sum(tpl * tpl)) + 1e-12)
         tpl = tpl / tpl_norm
 
@@ -448,9 +454,6 @@ class WatermarkDetector:
         if seg.size < HDR_L:
             return False, 0, 0.0
 
-        # PN for header: fixed (counter-independent)
-        hdr_pn = 2.0 * self.sec.pn_bits(0, HDR_L).astype(np.float32) - 1.0
-
         # Align using the same matched-filter taps as payload (robust to room tail)
         h = self._matched_filter_taps(band)
         mf = np.convolve(seg, h, mode="full").astype(np.float32, copy=False)
@@ -473,13 +476,13 @@ class WatermarkDetector:
             if i0 < 0 or i1 > mf_win.size:
                 continue
             a = mf_win[i0:i1]
-            score = float(np.mean(np.abs(a[guard:] * hdr_pn[guard:])))
+            score = float(np.mean(np.abs(a[guard:] * self._hdr_pn_sy[guard:])))
 
             if score > best_score:
                 best_score, best_s = score, s
         i0, i1 = base + best_s, base + best_s + seg.size
         a = mf_win[i0:i1]
-        d = a * hdr_pn
+        d = a * self._hdr_pn_sy
 
         # Majority over 8-chip groups -> 16 bits (MSB-first)
         sums = d.reshape(HDR_BITS, HDR_REPEAT).sum(axis=1)

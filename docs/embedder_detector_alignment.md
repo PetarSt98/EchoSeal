@@ -67,3 +67,38 @@ specification, so future drift in those critical assumptions will surface quickl
   report a skipped test instead of a hard error. This keeps the suite green in
   minimal environments while still exercising the checks whenever the optional
   packages are available.【F:tests/test_embedder_detector_alignment.py†L1-L70】
+
+## Follow-up PR timeline
+The repeated reviews resulted in a series of narrowly scoped patches. The list
+below documents why each PR existed, what changed, and how those adjustments
+surface in the current code base.
+
+1. **Cold-start matched filter fix.** The detector now preserves the IIR tail
+   by prefilling the payload matched-filter window with the preamble/header
+   tail and widening the shift search so despreading can recover the proper
+   chip phase.【F:rtwm/detector.py†L300-L374】
+2. **Crypto fallback and embedder/detector audit.** A cached AEAD handle lets
+   the detector transparently retry both nonce layouts before giving up, while
+   the embedder continues to seal the same `ESAL‖ctr‖nonce` payload that the
+   detector authenticates.【F:rtwm/embedder.py†L153-L168】【F:rtwm/detector.py†L177-L233】【F:rtwm/detector.py†L389-L431】
+3. **Cached PN sequences and frame guards.** Both modules precompute the
+   preamble/header PN symbols, slice the payload PN from the same generator, and
+   assert the 63 + 128 + 1024 chip structure each frame so drift is caught at
+   runtime.【F:rtwm/embedder.py†L26-L121】【F:rtwm/detector.py†L26-L119】
+4. **Cascaded filtering alignment.** Correlation templates and matched-filter
+   taps are now derived from the transmit∘receive cascade, matching what the
+   embedder actually emits before despreading.【F:rtwm/detector.py†L48-L76】【F:rtwm/detector.py†L242-L313】
+5. **Regression coverage.** The new regression test confirms the embedder and
+   detector reuse the exact PN sequences and filtering pipeline documented
+   above.【F:tests/test_embedder_detector_alignment.py†L1-L70】
+6. **Test guards for optional dependencies.** Import guards ensure the
+   alignment tests skip cleanly when NumPy/SciPy are absent so minimal CI stays
+   green without masking regressions when those packages are installed.【F:tests/test_embedder_detector_alignment.py†L1-L70】
+7. **Documentation clarity.** This note now records the shared assumptions and
+   validates them against the code so reviewers can verify future fixes without
+   reopening the same questions.【F:docs/embedder_detector_alignment.md†L1-L118】
+
+With these stages complete, the current implementation keeps the embedder and
+detector synchronized across filtering, spreading, polar coding, and crypto. No
+further code changes are required for the alignment review; this PR exists only
+to capture the rationale behind the earlier sequence of fixes.

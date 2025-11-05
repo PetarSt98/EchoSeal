@@ -84,7 +84,8 @@ class StreamPRNG:
     """
     Deterministic AES-CTR stream generator.
 
-    • A 128-bit sub-key is derived from the 256-bit master key via BLAKE2s(person=b'EchoSealPN').
+    • A 128-bit sub-key is derived from the 256-bit master key via BLAKE2s(person=b'EchoSeal').
+      (BLAKE2s personalizations are capped at 8 bytes.)
     • For frame `n`, we reserve a unique 2⁶⁴-block counter space by left-shifting the
       frame counter:   counter = (frame_ctr << 64) | block_idx
     • Generates cryptographically strong pseudo-random bytes for PN spreading.
@@ -92,7 +93,7 @@ class StreamPRNG:
 
     def __init__(self, master_key: bytes):
         sub_key = hashlib.blake2s(
-            master_key, digest_size=16, person=b"EchoSealPN"
+            master_key, digest_size=16, person=b"EchoSeal"
         ).digest()
         if _PCAES is not None:
             self._aes = _PCAES.new(sub_key, _PCAES.MODE_ECB)

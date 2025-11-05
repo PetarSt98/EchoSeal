@@ -31,6 +31,14 @@ class WatermarkDetector:
         self._band_key = getattr(self.sec, "band_key", key32)
         self._mf_cache = {}
         self._list_size = int(list_size)
+        self._aead = getattr(self.sec, "_aead", None)
+        # Cache the static symbol sequences so detector & embedder stay aligned.
+        self._pre_sy = 2.0 * PRE_BITS.astype(np.float32) - 1.0
+        self._hdr_pn_sy = 2.0 * self.sec.pn_bits(0, HDR_L).astype(np.float32) - 1.0
+        if self._hdr_pn_sy.size != HDR_L:
+            raise RuntimeError(
+                f"Header PN length {self._hdr_pn_sy.size} != expected {HDR_L}"
+            )
 
     # ------------------------------------------------------------------ API
     def verify(self, audio: np.ndarray, fs_in: int) -> bool:
@@ -52,8 +60,11 @@ class WatermarkDetector:
         y = lfilter(b, a, signal.astype(np.float32, copy=False))
 
         # 2) Filtered preamble template (zero-state), unit-normalize
-        pre_sy = 2.0 * PRE_BITS.astype(np.float32) - 1.0
-        tpl = lfilter(b, a, pre_sy)
+        # The embedder already band-pass filters the watermark, and we apply the
+        # same filter again during detection. Build a template that matches the
+        # cascaded response so correlation scores line up with the received
+        # waveform.
+        tpl = lfilter(b, a, lfilter(b, a, self._pre_sy))
         tpl_norm = float(np.sqrt(np.sum(tpl * tpl)) + 1e-12)
         tpl = tpl / tpl_norm
 
@@ -188,7 +199,11 @@ class WatermarkDetector:
             print(f"    Crypto OK, plain len: {len(plain)}; "
                   f"magic={plain[:4]!r}, ctr={int.from_bytes(plain[4:8], 'big')}")
         except Exception  as e:
-            if len(blob) >= 4 and blob[:4] == b"ESAL":
+            fallback_plain, layout = self._decrypt_blob_fallback(blob)
+            if fallback_plain is not None:
+                plain = fallback_plain
+                print(f"    Crypto OK via fallback layout '{layout}', plain len: {len(plain)}")
+            elif len(blob) >= 4 and blob[:4] == b"ESAL":
                 plain = blob
                 print("    Crypto skipped: payload appears to be PLAINTEXT (legacy mode)")
             else:
@@ -256,19 +271,22 @@ class WatermarkDetector:
         # (at 48 kHz this is ≳5 ms, enough for a 4th-order BPF tail)
         M = max(256, M_base * 64)
 
-        imp = np.zeros(M, dtype=np.float32);
+        imp = np.zeros(M, dtype=np.float32)
         imp[0] = 1.0
-        g = lfilter(b, a, imp).astype(np.float32)
+        g_tx = lfilter(b, a, imp).astype(np.float32)
+        # Detector applies the same band-pass before matched filtering, so the
+        # effective channel is the cascade of TX+RX filters.
+        g_eff = np.convolve(g_tx, g_tx).astype(np.float32)
 
         # --- truncate by energy: keep 99.9% of the impulse energy ---
-        e = g * g
+        e = g_eff * g_eff
         c = np.cumsum(e)
         total = float(c[-1]) + 1e-20
         idx = int(np.searchsorted(c, 0.999 * total))  # 99.9%
-        g = g[:idx + 1] if idx + 1 < g.size else g
+        g_eff = g_eff[:idx + 1] if idx + 1 < g_eff.size else g_eff
 
-        # Matched filter is time-reverse of g
-        h = g[::-1]
+        # Matched filter is time-reverse of g_eff
+        h = g_eff[::-1]
         # Unit-energy normalize
         h /= (np.sqrt(float(np.sum(h * h))) + 1e-12)
 
@@ -295,26 +313,43 @@ class WatermarkDetector:
         pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0  # ±1
 
         # --- payload segment (skip preamble + header)
-        rx = frame[PRE_L + HDR_L:].astype(np.float32, copy=False)
-        n = min(rx.size, pn_sy.size)
-        if n <= 0:
-            return np.zeros(N, dtype=np.float32)
-        rx = rx[:n]
-        pn_sy = pn_sy[:n]
-
-        # Add this right after: pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0
-        print(f"[DETECTOR] Frame {frame_id}")
-        print(f"  pn_payload[:32]: {pn_payload[:32]}")
-        print(f"  rx[:8]: {rx[:8]}")
-        print(f"  despread[:8] (before shift search): {(rx[:8] * pn_sy[:8])}")
-
-        # --- matched filter (long, truncated to ~99.9% energy)
         band = choose_band(self._band_key, frame_id)
         h = self._matched_filter_taps(band)
-        mf = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
-        offset = len(h) - 1
+        mem = len(h) - 1
+        payload_start = PRE_L + HDR_L
+        if payload_start >= frame.size:
+            return np.zeros(N, dtype=np.float32)
+
+        rx_payload = frame[payload_start:].astype(np.float32, copy=False)
+        if rx_payload.size == 0:
+            return np.zeros(N, dtype=np.float32)
+
+        prefix_len = min(mem, payload_start)
+        if prefix_len > 0:
+            prefix = frame[payload_start - prefix_len:payload_start].astype(np.float32, copy=False)
+            rx_full = np.concatenate([prefix, rx_payload])
+        else:
+            rx_full = rx_payload
+
+        mf = np.convolve(rx_full, h, mode="full").astype(np.float32, copy=False)
+        offset = prefix_len + mem
+
+        n = min(pn_sy.size, rx_payload.size)
+        if n <= 0:
+            return np.zeros(N, dtype=np.float32)
+
+        pn_sy = pn_sy[:n]
+        rx_payload = rx_payload[:n]
+
+        print(f"[DETECTOR] Frame {frame_id}")
+        print(f"  pn_payload[:32]: {pn_payload[:32]}")
+        print(f"  rx[:8]: {rx_payload[:8]}")
+        print(f"  despread[:8] (before shift search): {(rx_payload[:8] * pn_sy[:8])}")
+
+        # --- matched filter (long, truncated to ~99.9% energy)
         # (4) wider shift search tied to filter memory
-        MAX_SHIFT = min(n//2, 4*len(h), HDR_L//2)
+        raw_shift = min(n // 2, 4 * len(h), HDR_L)
+        MAX_SHIFT = max(mem, raw_shift)
         MARGIN = MAX_SHIFT
         start = max(0, offset - MARGIN)
         stop = min(mf.size, offset + n + MARGIN)
@@ -323,7 +358,7 @@ class WatermarkDetector:
 
 
         # --- guard region to avoid preamble tail bias
-        guard = int(max(16, min(64, len(h) // 8)))
+        guard = int(min(n // 4, max(len(h) // 2, 24)))
         if guard >= n:
             guard = max(0, n // 4)
 
@@ -387,12 +422,15 @@ class WatermarkDetector:
           B) (ciphertext || tag) || nonce
         Return (plaintext_bytes, layout_string) on success, or (None, None).
         """
+        if self._aead is None:
+            return None, None
+
         # A) nonce at the front (what crypto.SecureChannel.seal() returns)
         if len(blob) >= 12:
             nonce_a = blob[:12]
             body_a = blob[12:]
             try:
-                pt = self.sec.open(blob)  # this is exactly (nonce_a || body_a)
+                pt = self._aead.decrypt(nonce_a, body_a, b"")
                 return pt, "nonce-front"
             except InvalidTag:
                 pass
@@ -402,7 +440,7 @@ class WatermarkDetector:
             nonce_b = blob[-12:]
             body_b = blob[:-12]
             try:
-                pt = self.aead.decrypt(nonce_b, body_b, None)  # same aead the SecureChannel uses
+                pt = self._aead.decrypt(nonce_b, body_b, b"")
                 return pt, "nonce-tail"
             except InvalidTag:
                 pass
@@ -423,14 +461,21 @@ class WatermarkDetector:
         if seg.size < HDR_L:
             return False, 0, 0.0
 
-        # PN for header: fixed (counter-independent)
-        hdr_pn = 2.0 * self.sec.pn_bits(0, HDR_L).astype(np.float32) - 1.0
-
         # Align using the same matched-filter taps as payload (robust to room tail)
         h = self._matched_filter_taps(band)
-        mf = np.convolve(seg, h, mode="full").astype(np.float32, copy=False)
-        offset = len(h) - 1
-        MAX_SHIFT = min(seg.size // 2, 4 * len(h))
+        prefix_len = min(len(h) - 1, PRE_L)
+        if prefix_len > 0:
+            prefix = frame[PRE_L - prefix_len:PRE_L].astype(np.float32, copy=False)
+            seg_full = np.concatenate((prefix, seg))
+        else:
+            seg_full = seg
+
+        mf = np.convolve(seg_full, h, mode="full").astype(np.float32, copy=False)
+        offset = (len(h) - 1) + prefix_len
+        MAX_SHIFT = min(seg.size // 2 + prefix_len, 4 * len(h))
+        mem = len(h) - 1
+        if MAX_SHIFT < mem:
+            MAX_SHIFT = mem
         start = max(0, offset - MAX_SHIFT)
         stop = min(mf.size, offset + seg.size + MAX_SHIFT)
         mf_win = mf[start:stop]
@@ -445,17 +490,18 @@ class WatermarkDetector:
             if i0 < 0 or i1 > mf_win.size:
                 continue
             a = mf_win[i0:i1]
-            score = float(np.mean(np.abs(a[guard:] * hdr_pn[guard:])))
+            corr = float(np.sum(a[guard:] * self._hdr_pn_sy[guard:]))
+            score = abs(corr)
 
             if score > best_score:
                 best_score, best_s = score, s
         i0, i1 = base + best_s, base + best_s + seg.size
         a = mf_win[i0:i1]
-        d = a * hdr_pn
+        d = a * self._hdr_pn_sy
 
         # Majority over 8-chip groups -> 16 bits (MSB-first)
         sums = d.reshape(HDR_BITS, HDR_REPEAT).sum(axis=1)
-        bits = (sums > 0.0).astype(np.uint8)
+        bits = (sums < 0.0).astype(np.uint8)
         margin = np.mean(np.abs(sums)) / (np.sqrt(np.mean(d*d)) + 1e-12)
         val = 0
 

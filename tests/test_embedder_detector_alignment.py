@@ -1,7 +1,9 @@
 import types
 
-import numpy as np
+import pytest
 
+np = pytest.importorskip("numpy")
+pytest.importorskip("scipy.signal")
 from scipy.signal import lfilter
 
 from rtwm.embedder import WatermarkEmbedder

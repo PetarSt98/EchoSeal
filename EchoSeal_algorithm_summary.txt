@@ -35,7 +35,7 @@ Step‑wise pipeline executed for every audio chunk handed to `WatermarkEmbedder
 ├───────────────┼────────────────────────────────────────────────────────┤
 │ 5. PN spread  │ • Pseudorandom bit‑stream (length = frame chips)       │
 │               │   Generator:                                           │
-│               │   – Sub‑key = BLAKE2s(master, person="EchoSealPN")     │
+│               │   – Sub‑key = BLAKE2s(master, person="EchoSeal")        │
 │               │   – AES‑ECB (128‑bit) used as raw block cipher         │
 │               │   – Counter = (frame_ctr « 64) | block_index           │
 │               │   – Output bytes → bits via `np.unpackbits`            │

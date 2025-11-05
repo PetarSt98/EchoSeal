@@ -39,5 +39,7 @@ crypto handling remain synchronized.
 ## Conclusion
 With the cached sequences, cascaded matched-filter taps, and shared polar/AEAD
 parameters in place, the embedder and detector now agree on filtering, spreading,
-CRC-aided polar coding, and encryption. No additional drift was found during
-this review.
+CRC-aided polar coding, and encryption. The new regression tests guard the shared
+PN sequences and verify that the embedder's frame filtering matches the documented
+specification, so future drift in those critical assumptions will surface quickly.
+【F:tests/test_embedder_detector_alignment.py†L1-L70】

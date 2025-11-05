@@ -43,3 +43,19 @@ CRC-aided polar coding, and encryption. The new regression tests guard the share
 PN sequences and verify that the embedder's frame filtering matches the documented
 specification, so future drift in those critical assumptions will surface quickly.
 【F:tests/test_embedder_detector_alignment.py†L1-L70】
+
+## Revalidation checklist (after alignment fixes)
+- **Filtering continuity:** Verified that transmit filtering keeps a continuous
+  IIR state from the preamble through the payload and that detection aligns with
+  the cascaded response before matched filtering, matching the expectations laid
+  out after the earlier regression fixes. 【F:rtwm/embedder.py†L136-L151】【F:rtwm/detector.py†L42-L515】
+- **Polar + CRC parity:** Confirmed the embedder still emits a CRC-aided
+  `N=1024` polar codeword per frame and the detector hands the same length of LLRs
+  into the list decoder with the validator hook that enforces the CRC and frame
+  counter checks. 【F:rtwm/embedder.py†L95-L123】【F:rtwm/detector.py†L154-L207】
+- **Crypto/session flow:** Re-checked that frames seal the `ESAL‖ctr‖nonce` body
+  with `SecureChannel` and that detection validates both nonce layouts before
+  asserting the session-level replay guard. 【F:rtwm/embedder.py†L153-L168】【F:rtwm/detector.py†L177-L233】
+- **Shared PN sequences:** Ensured cached PN slices match across modules and the
+  regression test exercises representative counters to prevent reintroduction of
+  the drift caught in earlier PRs. 【F:rtwm/embedder.py†L29-L134】【F:rtwm/detector.py†L27-L342】【F:tests/test_embedder_detector_alignment.py†L1-L70】

@@ -1,56 +1,41 @@
 """
-polar_fast – thin wrapper around rtwm.fastpolar.PolarCode
-CRC-aided successive-cancellation list decoding (configurable list_size; default 8).
+Byte-level convenience wrapper around :class:`rtwm.fastpolar.PolarCode`.
+
+The embedder calls :func:`encode` with the 55-byte sealed payload; the
+detector calls :func:`decode` with length-N LLRs (positive favours bit = 1).
+Code instances are cached per configuration.
 """
 from __future__ import annotations
 
-import logging
-from typing import Tuple, Optional, Callable
+from typing import Callable
 
 import numpy as np
+
 from rtwm.fastpolar import PolarCode
 
-# Defaults match your pipeline
-N_DEFAULT = 1024          # codeword length
-K_DEFAULT = 448           # info+CRC bits (info = 440 bits = 55 bytes)
+N_DEFAULT = 1024                       # codeword length (chips per payload)
+K_DEFAULT = 448                        # information + CRC bits
+CRC_BITS = PolarCode.CRC_BITS          # 8
+PAYLOAD_BYTES = (K_DEFAULT - CRC_BITS) // 8  # 55
 
-# Cache PolarCode instances by full configuration
-_cache: dict[tuple[int, int, int, int], PolarCode] = {}
+_cache: dict[tuple[int, int, int], PolarCode] = {}
 
-def _pc(N: int, K: int, list_size: int, crc_size: int) -> PolarCode:
-    key = (N, K, list_size, crc_size)
+
+def _pc(N: int, K: int, list_size: int) -> PolarCode:
+    key = (N, K, list_size)
     if key not in _cache:
-        _cache[key] = PolarCode(N, K, list_size=list_size, crc_size=crc_size)
+        _cache[key] = PolarCode(N, K, list_size=list_size)
     return _cache[key]
 
-def encode(
-    payload: bytes,
-    *,
-    N: int = N_DEFAULT,
-    K: int = K_DEFAULT,
-    list_size: int = 8,
-    crc_size: int = 8,
-    debug: bool = False
-) -> np.ndarray:
-    """
-    Encode a 55-byte (440-bit) payload by appending CRC-8 (poly 0x07) to form K=448
-    info+CRC bits, place them in the unfrozen positions, and return the length-N
-    (1024) polar codeword as a 0/1 numpy array.
-    """
-    pc = _pc(N, K, list_size, crc_size)
+
+def encode(payload: bytes, *, N: int = N_DEFAULT, K: int = K_DEFAULT) -> np.ndarray:
+    """Encode `payload` into a length-N 0/1 codeword (CRC-8 appended)."""
+    pc = _pc(N, K, 1)
     info_bytes = (pc.K - pc.crc_size) // 8
     if len(payload) != info_bytes:
         raise ValueError(f"payload must be {info_bytes} bytes (got {len(payload)})")
+    return pc.encode(np.unpackbits(np.frombuffer(payload, dtype="u1")))
 
-    bits = np.unpackbits(np.frombuffer(payload, dtype="u1"))
-    if debug:
-        logging.debug("[ENCODE] payload_hex=%s", payload.hex())
-        logging.debug("[ENCODE] bits[:32]=%s", bits[:32])
-
-    encoded = pc.encode(bits)  # -> length N, dtype=uint8
-    if debug:
-        logging.debug("[ENCODE] code[:32]=%s", encoded[:32])
-    return encoded
 
 def decode(
     llr: np.ndarray,
@@ -58,30 +43,18 @@ def decode(
     N: int = N_DEFAULT,
     K: int = K_DEFAULT,
     list_size: int = 8,
-    crc_size: int = 8,
     return_ok: bool = False,
-    debug: bool = False,
-    validator: Optional[Callable[[bytes], bool]] = None
-) -> Optional[bytes] | Tuple[bytes, bool]:
+    validator: Callable[[bytes], bool] | None = None,
+) -> bytes | None | tuple[bytes, bool]:
+    """Decode length-N LLRs back into the payload bytes.
+
+    Returns the payload on success and ``None`` on failure, or
+    ``(payload, ok)`` when ``return_ok`` is set.  ``validator`` (payload ->
+    bool) selects among CRC-passing SCL candidates, e.g. AEAD verification.
     """
-    Decode length-N LLRs (positive favors bit=1). On CRC pass, returns 55-byte
-    payload. If `return_ok=True`, returns (payload_bytes, ok).
-    """
-    pc = _pc(N, K, list_size, crc_size)
-
-    llr = np.asarray(llr)
-    if llr.ndim != 1 or llr.size != pc.N:
-        raise ValueError(f"LLR length {llr.size} != N {pc.N}")
-
-    bits, ok = pc.decode(llr, validator=validator)  # -> 440 info bits (uint8), ok flag
-
-    if debug:
-        logging.debug("[DECODE] info_bits[:32]=%s ok=%s", bits[:32], ok)
-        if not ok:
-            # Only log length, not full data, to avoid leaks
-            logging.debug("[DECODE] CRC failed; returning best candidate (len=%d bits)", bits.size)
-
-    payload = np.packbits(bits).tobytes()  # -> 55 bytes
+    pc = _pc(N, K, list_size)
+    bits, ok = pc.decode(llr, validator=validator)
+    payload = np.packbits(bits).tobytes()
     if return_ok:
         return payload, ok
-    return None if not ok else payload
+    return payload if ok else None

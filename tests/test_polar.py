@@ -1,138 +1,136 @@
-import importlib.util
-import os
-import sys
-import types
-from pathlib import Path
-
 import numpy as np
+import pytest
+
+from rtwm.fastpolar import PolarCode
+from rtwm.polar_fast import (
+    K_DEFAULT,
+    N_DEFAULT,
+    PAYLOAD_BYTES,
+    decode,
+    encode,
+)
 
 
-def _load_rtwm_module(module: str):
-    root = Path(__file__).resolve().parents[1] / "rtwm"
-    pkg = sys.modules.get("rtwm")
-    if pkg is None:
-        pkg = types.ModuleType("rtwm")
-        pkg.__path__ = [str(root)]  # type: ignore[attr-defined]
-        sys.modules["rtwm"] = pkg
-
-    name = f"rtwm.{module}"
-    if name in sys.modules:
-        return sys.modules[name]
-
-    spec = importlib.util.spec_from_file_location(name, root / f"{module}.py")
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load module {name}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-polar_fast = _load_rtwm_module("polar_fast")
-fastpolar = _load_rtwm_module("fastpolar")
-
-encode = polar_fast.encode
-decode = polar_fast.decode
-N_DEFAULT = polar_fast.N_DEFAULT
-K_DEFAULT = polar_fast.K_DEFAULT
-PolarCode = fastpolar.PolarCode
-
-def test_polar_roundtrip():
-    crc_size = 8
-    info_bits = K_DEFAULT - crc_size  # 440 bits → 55 bytes
-    payload = np.frombuffer(os.urandom(info_bits // 8), dtype="u1")
-    bits = np.unpackbits(payload)
-
-    assert bits.size == info_bits
-
-    pc = PolarCode(N_DEFAULT, K_DEFAULT, list_size=8, crc_size=crc_size)
-    encoded = pc.encode(bits)
-
-    assert encoded.size == N_DEFAULT
-
-    llr = np.where(encoded == 1, 10.0, -10.0).astype(np.float32)
-
-    decoded_bits, ok = pc.decode(llr)
-    assert decoded_bits.size == info_bits
-    assert ok is True
-
-    recovered = np.packbits(decoded_bits).tobytes()
-    assert recovered == payload.tobytes()
-
-
-def test_polar_awgn_roundtrip():
-    """Polar encoder/decoder should round-trip through an AWGN channel."""
-
-    rng = np.random.default_rng(1234)
-
-    pc = PolarCode(N_DEFAULT, K_DEFAULT, list_size=8, crc_size=8)
-    info_len = pc.K - pc.crc_size
-    info_bits = rng.integers(0, 2, info_len, dtype=np.uint8)
-
-    codeword = pc.encode(info_bits)
-    assert codeword.shape == (pc.N,)
-
-    sigma = 0.15
+def _awgn_llr(codeword: np.ndarray, sigma: float, rng) -> np.ndarray:
+    """BPSK over AWGN; LLR convention log(P1/P0) => llr = 2r/sigma^2."""
     tx = 2.0 * codeword.astype(np.float64) - 1.0
-    noise = rng.normal(0.0, sigma, size=tx.size)
-    rx = tx + noise
-    llr = 2.0 * rx / (sigma**2)
-
-    decoded_bits, ok = pc.decode(llr)
-
-    assert ok is True
-    assert decoded_bits.shape == (info_len,)
-    np.testing.assert_array_equal(decoded_bits, info_bits)
+    rx = tx + rng.normal(0.0, sigma, tx.size)
+    return 2.0 * rx / sigma**2
 
 
-def test_polar_fast_wrapper_awgn_roundtrip():
-    """The polar_fast convenience wrappers should also survive AWGN."""
+# ────────────────────────────── construction ──────────────────────────────
+def test_info_set_uses_most_reliable_channels():
+    """Regression: info bits belong on the *most* reliable channels.
 
-    rng = np.random.default_rng(4321)
+    Channel 0 is always the least reliable and channel N-1 the most reliable,
+    so index 0 must be frozen and index N-1 must carry data.
+    """
+    pc = PolarCode(N_DEFAULT, K_DEFAULT)
+    assert pc.frozen[0]
+    assert not pc.frozen[N_DEFAULT - 1]
+    assert int((~pc.frozen).sum()) == K_DEFAULT
 
-    payload = rng.integers(0, 256, size=(K_DEFAULT - 8) // 8, dtype=np.uint8).tobytes()
 
-    codeword = encode(payload)
-    assert codeword.shape == (N_DEFAULT,)
+def test_polar_transform_is_involution():
+    rng = np.random.default_rng(0)
+    u = rng.integers(0, 2, 1024, dtype=np.uint8)
+    once = PolarCode._polar_transform(u)
+    assert np.array_equal(PolarCode._polar_transform(once), u)
 
-    sigma = 0.15
-    tx = 2.0 * codeword.astype(np.float64) - 1.0
-    noise = rng.normal(0.0, sigma, size=tx.size)
-    rx = tx + noise
-    llr = 2.0 * rx / (sigma**2)
 
+def test_crc8_known_answer():
+    """CRC-8 (poly 0x07, init 0) of b'123456789' is the standard 0xF4."""
+    pc = PolarCode(N_DEFAULT, K_DEFAULT)
+    bits = np.unpackbits(np.frombuffer(b"123456789", dtype=np.uint8))
+    crc = pc._crc8(bits)
+    assert int(np.packbits(crc)[0]) == 0xF4
+
+
+def test_invalid_parameters_raise():
+    with pytest.raises(ValueError):
+        PolarCode(1000, 448)          # not a power of two
+    with pytest.raises(ValueError):
+        PolarCode(2048, 448)          # exceeds reliability table
+    with pytest.raises(ValueError):
+        PolarCode(1024, 4)            # K <= crc_size
+    with pytest.raises(ValueError):
+        PolarCode(1024, 448, crc_size=16)  # only CRC-8 supported
+
+
+# ────────────────────────────── round-trips ───────────────────────────────
+def test_clean_roundtrip():
+    rng = np.random.default_rng(1)
+    pc = PolarCode(N_DEFAULT, K_DEFAULT, list_size=8)
+    info = rng.integers(0, 2, pc.K - pc.crc_size, dtype=np.uint8)
+    cw = pc.encode(info)
+
+    assert cw.shape == (N_DEFAULT,)
+    llr = 20.0 * (cw.astype(np.float64) - 0.5)
+    bits, ok = pc.decode(llr)
+    assert ok
+    assert np.array_equal(bits, info)
+
+
+def test_awgn_roundtrip_at_realistic_snr():
+    """SCL-8 must recover the payload at ~2.5 dB per-chip SNR (sigma=0.75).
+
+    This is the operating point that exposed the frozen-set direction bug:
+    with info bits on the wrong channels the decoder fails 100% here.
+    """
+    pc = PolarCode(N_DEFAULT, K_DEFAULT, list_size=8)
+    for seed in (10, 11, 12):
+        rng = np.random.default_rng(seed)
+        info = rng.integers(0, 2, pc.K - pc.crc_size, dtype=np.uint8)
+        llr = _awgn_llr(pc.encode(info), 0.75, rng)
+        bits, ok = pc.decode(llr)
+        assert ok, f"decode failed at seed {seed}"
+        assert np.array_equal(bits, info)
+
+
+def test_hopeless_snr_reports_failure():
+    rng = np.random.default_rng(2)
+    payload = rng.bytes(PAYLOAD_BYTES)
+    llr = _awgn_llr(encode(payload), 2.5, rng)  # ~ -8 dB per-chip SNR
+    assert decode(llr, validator=lambda b: b == payload) is None
+
+
+def test_smaller_block_length():
+    """Nested reliability sequence supports any power-of-two N <= 1024."""
+    rng = np.random.default_rng(3)
+    pc = PolarCode(256, 112, list_size=8)
+    info = rng.integers(0, 2, pc.K - pc.crc_size, dtype=np.uint8)
+    llr = _awgn_llr(pc.encode(info), 0.5, rng)
+    bits, ok = pc.decode(llr)
+    assert ok
+    assert np.array_equal(bits, info)
+
+
+# ─────────────────────────── byte-level wrapper ───────────────────────────
+def test_wrapper_roundtrip_with_noise():
+    rng = np.random.default_rng(4)
+    payload = rng.bytes(PAYLOAD_BYTES)
+    llr = _awgn_llr(encode(payload), 0.75, rng)
     recovered, ok = decode(llr, return_ok=True)
-
-    assert ok is True
+    assert ok
     assert recovered == payload
 
-def test_crc8():
-    pc = PolarCode(1024, 448)
-    bits = np.random.randint(0, 2, 440, dtype=np.uint8)
-    crc = pc._crc8(bits)
-    assert np.all(pc._crc8(bits) == crc)
-    assert len(crc) == 8
+
+def test_encode_is_deterministic():
+    payload = bytes(range(PAYLOAD_BYTES))
+    assert np.array_equal(encode(payload), encode(payload))
 
 
-def test_polar_with_noise():
-    pc = PolarCode(N_DEFAULT, K_DEFAULT, list_size=8, crc_size=8)
-    bits = np.random.randint(0, 2, K_DEFAULT - 8, dtype=np.uint8)
-    enc = pc.encode(bits)
+def test_validator_arbitrates_between_candidates():
+    """The detector uses AEAD-open as validator: it must gate `ok`."""
+    payload = bytes(PAYLOAD_BYTES)
+    llr = 20.0 * (encode(payload).astype(np.float64) - 0.5)
 
-    # Add some noise
-    snr_db = 10  # Start with good SNR
-    signal_power = 1.0
-    noise_power = signal_power / (10 ** (snr_db / 10))
+    assert decode(llr, validator=lambda b: False) is None
+    assert decode(llr, validator=lambda b: b == payload) == payload
 
-    # Convert to BPSK and add noise
-    bpsk = 2 * enc.astype(float) - 1
-    noisy = bpsk + np.random.normal(0, np.sqrt(noise_power), len(bpsk))
 
-    # Calculate LLR
-    llr = 2 * noisy / noise_power
-
-    dec_bits, ok = pc.decode(llr)
-    print(f"SNR: {snr_db}dB, Decode success: {ok}")
-    if ok:
-        print(f"BER: {np.mean(bits != dec_bits[:len(bits)]):.6f}")
-
+def test_wrapper_rejects_bad_lengths():
+    with pytest.raises(ValueError):
+        encode(b"short")
+    with pytest.raises(ValueError):
+        decode(np.zeros(100))

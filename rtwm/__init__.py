@@ -1,12 +1,13 @@
 """
 rtwm – Real-Time audio watermarking package.
 
-The public API re-exports the main classes:
+Public API:
 
     WatermarkEmbedder  – real-time spread-spectrum TX
-    WatermarkDetector  – offline RX / verifier
+    WatermarkDetector  – offline RX: scan / analyze / verify recordings
+    FrameHit, Report   – detector result types
 """
+from .detector import FrameHit, Report, WatermarkDetector
 from .embedder import WatermarkEmbedder
-from .detector import WatermarkDetector
 
-__all__: list[str] = ["WatermarkEmbedder", "WatermarkDetector"]
+__all__: list[str] = ["WatermarkEmbedder", "WatermarkDetector", "FrameHit", "Report"]

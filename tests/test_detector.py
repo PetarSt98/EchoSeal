@@ -1,75 +1,75 @@
+"""
+Fast TX -> RX round-trip tests (digital loopback, speech-shaped host noise).
+
+The whole file must run in seconds: happy paths decode through the polar
+hard-decision fast path, and rejection paths are gated before any list
+decoding happens.  Shared fixtures live in conftest.py.
+"""
 import numpy as np
-from rtwm.embedder  import WatermarkEmbedder
-from rtwm.detector  import WatermarkDetector
-from rtwm.crypto    import SecureChannel
-from rtwm.utils     import choose_band
 
-# We want to feed the detector *exactly* what it expects.
-FS   = 48_000
-KEY  = b"\xAA"*32
-SEC  = SecureChannel(KEY)
-BAND = choose_band(KEY, 0)
+from rtwm import frame
+from rtwm.detector import WatermarkDetector
+from rtwm.utils import resample_to
 
-# -----------------------------------------------------------------------------
-def _generate_clean_frame():
-    """Return one clean frame embedded into a longer dummy recording."""
-    tx = WatermarkEmbedder(KEY)
-    chips = tx._make_frame_chips()  # length = 1087
+from conftest import FS, KEY
 
-    # Embed into 3s dummy recording (zero-padded)
-    fs = FS
-    full_len = int(3.0 * fs)
-    signal = np.zeros(full_len, dtype=np.float32)
 
-    # insert in middle
-    start = 0
-    signal[start:start + chips.size] = chips
-    return signal
-                           # length = 1 087
+def test_loopback_verify(marked_10s):
+    assert WatermarkDetector(KEY).verify(marked_10s, FS) is True
 
-# -----------------------------------------------------------------------------
-def test_detector_on_perfect_frame():
-    """Detector should pass on a pristine frame with no host audio."""
-    frame = _generate_clean_frame()
-    ok = WatermarkDetector(KEY).verify(frame, FS)
-    assert ok, "Detector failed on pristine watermark frame"
 
-# -----------------------------------------------------------------------------
-def test_frame_alignment_search():
-    """
-    Shift the frame by every offset from −40 … +40 chips and see where the
-    detector starts succeeding.  If it only passes, say, at +31, you know
-    the correlation peak is 31 chips late.
-    """
-    frame = _generate_clean_frame()
-    det   = WatermarkDetector(KEY)
+def test_scan_reports_consecutive_frames(marked_10s):
+    hits = WatermarkDetector(KEY).scan(marked_10s, FS)
+    assert len(hits) >= 8  # 10 s contain ~12 frames
 
-    results = {}
-    for off in range(-40, 41):
-        padded = np.pad(frame, (max(0,  off), max(0, -off)), mode='constant')
-        ok = det.verify(padded, FS)
-        results[off] = ok
-        det.session_nonce = None                # reset anti-replay
+    ctrs = [h.ctr for h in hits]
+    starts = np.array([h.start for h in hits])
+    assert ctrs == sorted(ctrs)
+    assert set(ctrs).issubset(set(range(13)))
+    # Frames are back-to-back: consecutive hits must be ~1 frame apart.
+    spacing = np.diff(starts) / frame.frame_samples()
+    assert np.all(np.abs(spacing - np.round(spacing)) < 0.01)
 
-    print("offset → passed:", {k:v for k,v in results.items() if v})
-    assert any(results.values()), "Detector never locks within ±40 chips"
 
-# -----------------------------------------------------------------------------
-def test_pn_sign_convention():
-    """
-    Manually despread the payload chips with RX's PN slice and check that the
-    mean sign matches TX's mapping (+1 ↔ bit=1, −1 ↔ bit=0).
-    """
-    tx_frame   = _generate_clean_frame()
-    pre        = 63
-    payload_tx = tx_frame[pre:]
+def test_excerpt_from_middle_verifies(marked_10s):
+    """Core requirement: a ~5 s excerpt cut anywhere must verify on its own."""
+    excerpt = marked_10s[int(3.123 * FS) : int(8.35 * FS)]
+    report = WatermarkDetector(KEY).analyze(excerpt, FS)
 
-    pn_full    = SEC.pn_bits(0, tx_frame.size)
-    pn_payl    = 2*pn_full[pre:] - 1            # ±1
+    assert report.verdict == "authentic"
+    assert len(report.hits) >= 4
+    # Counters are recovered from the frame headers, not from file position.
+    assert min(h.ctr for h in report.hits) >= 3
 
-    despread   = payload_tx * pn_payl
-    mean_sign  = np.mean(despread)
 
-    print("mean(despread) =", mean_sign)
-    # For random data we expect mean ≈ 0.  If it's ≈ +1 or −1, the sign is off.
-    assert abs(mean_sign) < 0.2, "PN despreading sign looks wrong"
+def test_polarity_inverted_recording_verifies(marked_10s):
+    excerpt = -marked_10s[: int(4.0 * FS)]
+    assert WatermarkDetector(KEY).verify(excerpt, FS) is True
+
+
+def test_resampled_recording_verifies(marked_10s):
+    """Detector must handle non-48k inputs (e.g. 44.1 kHz recordings)."""
+    excerpt = marked_10s[: int(5.0 * FS)]
+    resampled, fs = resample_to(44_100, excerpt.astype(np.float64), FS)
+    assert WatermarkDetector(KEY).verify(resampled, fs) is True
+
+
+def test_unwatermarked_audio_is_rejected(make_host):
+    noise = make_host(4.0, seed=99)
+    assert WatermarkDetector(KEY).verify(noise, FS) is False
+
+
+def test_wrong_key_is_rejected(marked_10s):
+    excerpt = marked_10s[: int(4.0 * FS)]
+    assert WatermarkDetector(b"\x33" * 32).verify(excerpt, FS) is False
+
+
+def test_clip_shorter_than_one_frame_is_rejected(marked_10s):
+    short = marked_10s[: frame.frame_samples() // 2]
+    assert WatermarkDetector(KEY).verify(short, FS) is False
+
+
+def test_stereo_input_is_downmixed(marked_10s):
+    excerpt = marked_10s[: int(4.0 * FS)]
+    stereo = np.stack([excerpt, excerpt], axis=1)
+    assert WatermarkDetector(KEY).verify(stereo, FS) is True

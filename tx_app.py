@@ -18,9 +18,11 @@ def parse_args():
     return p.parse_args()
 
 def load_key(path_or_hex: str) -> bytes:
-    if len(path_or_hex) in (32, 48, 64):  # hex string
-        return bytes.fromhex(path_or_hex)
-    return open(path_or_hex, "rb").read()
+    stripped = path_or_hex.strip()
+    if len(stripped) == 64 and all(c in "0123456789abcdefABCDEF" for c in stripped):
+        return bytes.fromhex(stripped)
+    with open(stripped, "rb") as f:
+        return f.read()
 
 def main():
     args = parse_args()

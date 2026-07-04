@@ -1,88 +1,170 @@
 """
-EchoSeal-RX – offline verifier GUI
+EchoSeal v0.2 — offline watermark verifier (GUI).
 """
 from __future__ import annotations
+
+import os
+import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import os, soundfile as sf
+from tkinter import filedialog, messagebox, ttk
 
-from rtwm.detector import WatermarkDetector
+import soundfile as sf
 
-HEX = "0123456789abcdefABCDEF"
+from gui.common import (
+    VERDICT_SUBLINE,
+    format_report,
+    load_key,
+    random_key_hex,
+)
+from rtwm.detector import Report, WatermarkDetector
 
-def load_key(src: str) -> bytes:
-    s = src.strip()
-    if len(s) == 64 and all(c in HEX for c in s):
-        return bytes.fromhex(s)
-    return open(os.path.expanduser(s), "rb").read()
 
 class RxGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("EchoSeal – Verifier")
-        self.resizable(False, False)
+        self.title("EchoSeal v0.2 — Verifier")
+        self.minsize(560, 480)
         ttk.Style(self).theme_use("clam")
 
-        frm = ttk.Frame(self, padding=16); frm.grid()
+        self._worker: threading.Thread | None = None
 
-        ttk.Label(frm, text="XChaCha20 key (64 hex) or file:").grid(sticky="w")
-        self.key_var = tk.StringVar(value="0"*64)
-        ttk.Entry(frm, width=60, textvariable=self.key_var).grid(row=0, column=1, pady=4)
+        root = ttk.Frame(self, padding=16)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(6, weight=1)
 
-        ttk.Label(frm, text="Audio file:").grid(row=1, column=0, sticky="w")
+        ttk.Label(
+            root,
+            text="Offline verification — authentic / tampered / no watermark",
+            font=("Segoe UI", 10),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+        ttk.Label(root, text="Key (64 hex chars or file):").grid(row=1, column=0, sticky="w")
+        self.key_var = tk.StringVar()
+        key_row = ttk.Frame(root)
+        key_row.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
+        ttk.Entry(key_row, textvariable=self.key_var, width=48).pack(side="left", fill="x", expand=True)
+        ttk.Button(key_row, text="File…", command=self._pick_key, width=6).pack(side="left", padx=(4, 0))
+        ttk.Button(key_row, text="Random", command=self._gen_key, width=7).pack(side="left", padx=(4, 0))
+
+        ttk.Label(root, text="Audio file:").grid(row=2, column=0, sticky="w")
         self.file_var = tk.StringVar()
-        ttk.Entry(frm, width=60, textvariable=self.file_var).grid(row=1, column=1, pady=4)
-        ttk.Button(frm, text="Browse…", command=self._pick).grid(row=1, column=2, padx=4)
+        file_row = ttk.Frame(root)
+        file_row.grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
+        ttk.Entry(file_row, textvariable=self.file_var, width=48).pack(side="left", fill="x", expand=True)
+        ttk.Button(file_row, text="Browse…", command=self._pick_audio, width=8).pack(side="left", padx=(4, 0))
 
-        self.verify_btn = ttk.Button(frm, text="Verify", command=self._verify)
-        self.verify_btn.grid(row=2, columnspan=3, pady=10)
+        self.verify_btn = ttk.Button(root, text="Verify", command=self._verify)
+        self.verify_btn.grid(row=3, column=0, columnspan=3, pady=12)
 
-        self.status = ttk.Label(frm, text="Awaiting file", font=("Helvetica", 11, "bold"))
-        self.status.grid(row=3, columnspan=3, pady=(6,0))
+        verdict_frm = ttk.LabelFrame(root, text="Verdict", padding=10)
+        verdict_frm.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self.verdict_lbl = ttk.Label(
+            verdict_frm,
+            text="Awaiting file",
+            font=("Segoe UI", 16, "bold"),
+        )
+        self.verdict_lbl.pack(anchor="w")
+        self.sub_lbl = ttk.Label(verdict_frm, text="", wraplength=500)
+        self.sub_lbl.pack(anchor="w", pady=(4, 0))
+
+        detail_frm = ttk.LabelFrame(root, text="Details", padding=8)
+        detail_frm.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+        detail_frm.rowconfigure(0, weight=1)
+        detail_frm.columnconfigure(0, weight=1)
+        self.detail = tk.Text(detail_frm, height=12, wrap="word", font=("Consolas", 10), state="disabled")
+        scroll = ttk.Scrollbar(detail_frm, command=self.detail.yview)
+        self.detail.configure(yscrollcommand=scroll.set)
+        self.detail.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
 
         self._centre()
 
-    # UI helpers
-    def _pick(self):
-        path = filedialog.askopenfilename(
-            title="Open audio", filetypes=[("Audio", "*.wav *.flac *.ogg *.m4a *.mp3"), ("All","*.*")]
-        )
-        if path: self.file_var.set(path)
+    def _pick_key(self) -> None:
+        path = filedialog.askopenfilename(title="Open key file", filetypes=[("Key", "*.*")])
+        if path:
+            self.key_var.set(path)
 
-    # verification
-    def _verify(self):
-        path = self.file_var.get()
+    def _gen_key(self) -> None:
+        self.key_var.set(random_key_hex())
+
+    def _pick_audio(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open audio",
+            filetypes=[
+                ("Audio", "*.wav *.flac *.ogg *.aiff *.aif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self.file_var.set(path)
+
+    def _set_detail(self, text: str) -> None:
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.insert("1.0", text)
+        self.detail.configure(state="disabled")
+
+    def _verify(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+
+        path = self.file_var.get().strip()
         if not os.path.isfile(path):
-            messagebox.showerror("No file", "Select a valid audio file."); return
+            messagebox.showerror("No file", "Select a valid audio file.")
+            return
         try:
             key = load_key(self.key_var.get())
             if len(key) != 32:
-                raise ValueError("Need 64-hex chars / 32-byte key")
-        except Exception as e:
-            messagebox.showerror("Key error", str(e)); return
+                raise ValueError("Key must be 256 bits (64 hex characters or 32 raw bytes).")
+        except Exception as exc:
+            messagebox.showerror("Key error", str(exc))
+            return
 
+        self.verify_btn["state"] = "disabled"
+        self.verdict_lbl.config(text="Checking…", foreground="black")
+        self.sub_lbl.config(text="")
+        self._set_detail(f"Analyzing {os.path.basename(path)} …")
+
+        self._worker = threading.Thread(
+            target=self._run_analysis,
+            args=(key, path),
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _run_analysis(self, key: bytes, path: str) -> None:
         try:
             data, fs = sf.read(path, always_2d=False)
-        except Exception as e:
-            messagebox.showerror("Read error", str(e)); return
+            report = WatermarkDetector(key).analyze(data, fs)
+            self.after(0, lambda: self._show_report(report))
+        except Exception as exc:
+            self.after(0, lambda: self._show_error(str(exc)))
 
-        self.verify_btn["state"] = "disabled"; self.status.config(text="Checking…", foreground="black")
-        self.update_idletasks()
-
-        ok = WatermarkDetector(key).verify(data, fs)
-
+    def _show_report(self, report: Report) -> None:
+        headline, color, lines = format_report(report)
+        self.verdict_lbl.config(text=headline, foreground=color)
+        self.sub_lbl.config(text=VERDICT_SUBLINE[report.verdict])
+        self._set_detail("\n".join(lines))
         self.verify_btn["state"] = "normal"
-        if ok:
-            self.status.config(text="✅  Authentic", foreground="green")
-        else:
-            self.status.config(text="⚠️  Tampered / No watermark", foreground="red")
 
-    def _centre(self):
+    def _show_error(self, message: str) -> None:
+        self.verdict_lbl.config(text="ERROR", foreground="#cf222e")
+        self.sub_lbl.config(text=message)
+        self._set_detail("")
+        self.verify_btn["state"] = "normal"
+
+    def _centre(self) -> None:
         self.update_idletasks()
-        w,h = self.winfo_width(), self.winfo_height()
-        x = (self.winfo_screenwidth()-w)//2
-        y = (self.winfo_screenheight()-h)//2
+        w, h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"+{x}+{y}")
 
-if __name__ == "__main__":
+
+def main() -> None:
     RxGUI().mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -42,6 +42,8 @@ dev = [
 [project.scripts]
 echoseal-tx = "tx_app:main"
 echoseal-rx = "rx_app:main"
+echoseal-tx-gui = "gui.tx_gui:main"
+echoseal-rx-gui = "gui.rx_gui:main"
 rtwm-tx = "tx_app:main"
 rtwm-rx = "rx_app:main"
 
@@ -82,6 +84,13 @@ filterwarnings = [
 # -------------------------------------------------------------------------
 #  build backend
 # -------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rtwm*", "gui*"]
+
+[tool.setuptools]
+py-modules = ["tx_app", "rx_app"]
+
 [build-system]
 requires      = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"

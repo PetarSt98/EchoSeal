@@ -33,7 +33,8 @@ class AudioLoop:
         self.save_path = save_path
         self._stream: sd.Stream | None = None
         self._output_buffer: list[np.ndarray] = []
-        self._samples_to_save = int(fs * save_seconds) if save_path else 0
+        self._save_max_samples = int(fs * save_seconds) if save_path else 0
+        self._samples_to_save = self._save_max_samples
 
     # ----------------------------------------------------------------- run
     def start(self) -> None:
@@ -72,5 +73,7 @@ class AudioLoop:
         if not (self.save_path and self._output_buffer):
             return
         audio = np.concatenate(self._output_buffer)
+        if self._save_max_samples:
+            audio = audio[: self._save_max_samples]
         sf.write(self.save_path, audio, self.fs)
         print(f"Saved {audio.size / self.fs:.1f}s to: {self.save_path}", flush=True)

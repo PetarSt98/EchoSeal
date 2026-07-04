@@ -1,135 +1,79 @@
-EchoSeal – Algorithmic Breakdown
-================================
+EchoSeal - Algorithm Summary (July 2026 codebase)
+==================================================
 
-This document enumerates every algorithmic component used inside EchoSeal,
-grouped by transmitter (TX) path, receiver (RX) path, cryptographic primitives
-and tamper–analysis logic.  File/line references match the July 2025 code base.
-
-
-──────────────────────────────────────────────────────────────────────────────
-1. Transmitter (WatermarkEmbedder)
-──────────────────────────────────────────────────────────────────────────────
-Step‑wise pipeline executed for every audio chunk handed to `WatermarkEmbedder.process()`.
-
-┌───────────────┬────────────────────────────────────────────────────────┐
-│ Step          │ Algorithms / Details                                   │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 1. Metadata   │ Constant magic “ESAL” · 32‑bit frame counter · 64‑bit  │
-│    assembly   │ session nonce (random)                                 │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 2. Encryption │ • XChaCha20‑Poly1305 AEAD                              │
-│               │   – 256‑bit master key                                 │
-│               │   – 192‑bit random nonce                               │
-│               │   – 128‑bit auth tag                                   │
-└───────────────┴────────────────────────────────────────────────────────┘
-      ↳ produces 56‑byte sealed payload (fits 448 information bits).
-
-┌───────────────┬────────────────────────────────────────────────────────┐
-│ 3. FEC        │ • Polar Code                                           │
-│ (encode)      │   – N = 1024, K = 448                                  │
-│               │   – CRC‑8, SCL list‑size = 8                           │
-│               │   – Library: fastpolar                                 │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 4. Preamble   │ • 63‑chip maximal‑length sequence (MLS) = [1 0 1]×21   │
-│   insertion   │   provides robust sync                                 │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 5. PN spread  │ • Pseudorandom bit‑stream (length = frame chips)       │
-│               │   Generator:                                           │
-│               │   – Sub‑key = BLAKE2s(master, person="EchoSealPN")     │
-│               │   – AES‑ECB (128‑bit) used as raw block cipher         │
-│               │   – Counter = (frame_ctr « 64) | block_index           │
-│               │   – Output bytes → bits via `np.unpackbits`            │
-│               │ • Modulation: BPSK symbol = (2·bit−1)·(2·pn−1)         │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 6. Frequency  │ • Sub‑band chosen per frame via                        │
-│    hopping    │   idx = HMAC‑SHA256(key, frame_ctr)[0] mod len(plan)   │
-│               │ • BAND_PLAN = {4–6, 8–10, 16–18, 18–22 kHz}            │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 7. Spectral   │ • 4th‑order Butterworth band‑pass (SciPy butter)       │
-│    shaping    │   coefficients regenerated for selected band          │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 8. Power      │ • Target level = −20 dB relative to short‑term RMS     │
-│    scaling    │   alpha = 10^(dB/20) · √(P_speech)/√(P_watermark)      │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ 9. Buffering  │ • Chips buffered in `self._chip_buf`; ring logic       │
-│               │   guarantees full frames despite arbitrary I/O size    │
-└───────────────┴────────────────────────────────────────────────────────┘
-Finally, watermark chips are sample‑wise added to the host audio and returned
-to PortAudio with < 50 ms latency.
+Goal: embed an inaudible, cryptographically verifiable watermark into speech
+in real time; later, an offline detector ingests any recording (or excerpt)
+and reports AUTHENTIC / TAMPERED / NO-WATERMARK, localising edits in time.
 
 
-──────────────────────────────────────────────────────────────────────────────
-2. Receiver (WatermarkDetector)
-──────────────────────────────────────────────────────────────────────────────
-Processing path inside `WatermarkDetector.verify(audio, fs_in)`.
+1. Frame format (rtwm/frame.py - single source of truth for TX and RX)
+-----------------------------------------------------------------------
+* One frame = 1215 BPSK symbols:
+      63-symbol MLS preamble | 128-symbol counter header | 1024 coded bits
+* 32 samples per symbol at 48 kHz -> 1.5 kBd, frame = 38 880 samples (0.81 s).
+* Frames repeat back-to-back forever; each is fully self-contained, so any
+  few-second excerpt holds several independently verifiable frames.
+* Per frame, a hop band is chosen from {4-6, 8-10, 16-18, 18-22} kHz via
+  HMAC-SHA256(band_key, ctr).  The carrier is the band centre snapped to a
+  multiple of the symbol rate (integer cycles/symbol); 4th-order Butterworth
+  band-pass shapes the spectrum.
 
-┌───────────────┬────────────────────────────────────────────────────────┐
-│ Step          │ Algorithms / Details                                   │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ A. Resample   │ • Integer‑ratio polyphase (`scipy.signal.resample_poly`)│
-│               │   to 48 kHz target                                     │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ B. Band scan  │ • Try predicted hop‑band first, then remaining bands   │
-│               │ • For each band:                                       │
-│               │   – 4th‑order Butterworth BPF                          │
-│               │   – Normalise to ±1                                    │
-│               │   – Cross‑correlate with (2·MLS−1)                     │
-│               │   – Adaptive threshold τ = 8·σ(corr)                   │
-│               │   – Peak indices → candidate frame starts              │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ C. Window     │ • For each peak, search ±3 frames, one‑time ±200 wide  │
-│    search     │   fallback (covers large drop/insert)                  │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ D. LLR build  │ • Compute Log‑Likelihood‑Ratio per chip:               │
-│               │   llr = (frame*sign) / σ_noise                         │
-│               │   sign = (2·pn−1)                                      │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ E. Polar      │ • SCL‑8 decode, validate CRC‑8                         │
-│    decoding   │ • Returns 56‑byte sealed blob or None                  │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ F. AEAD       │ • XChaCha20‑Poly1305 decrypt & verify tag              │
-│    decrypt    │ • Raises InvalidTag on failure                         │
-├───────────────┼────────────────────────────────────────────────────────┤
-│ G. Frame/     │ • Validate “ESAL” magic                                 │
-│    nonce      │ • Counter must equal expected ctr                      │
-│    checks     │ • First good frame establishes session_nonce           │
-│               │   subsequent frames must match (anti‑splice)           │
-└───────────────┴────────────────────────────────────────────────────────┘
-Return value: *True* once one authentic frame for current session is found.
+2. Per-frame payload (rtwm/embedder.py, rtwm/crypto.py, rtwm/fastpolar.py)
+---------------------------------------------------------------------------
+* Plaintext (27 B): "ESAL" | 32-bit frame counter | 8-B session nonce | pad.
+* Sealed with ChaCha20-Poly1305 -> 55 B (nonce | ciphertext | tag).
+  Sub-keys (AEAD, PN, band hop) derived from the 256-bit master key via HKDF.
+* FEC: CRC-8-aided polar code, N=1024, K=448, SCL decoding (5G reliability
+  sequence).  Payload bits are scrambled by an AES-CTR PN stream keyed per
+  frame; the header carries the low 16 counter bits under a fixed PN.
 
+3. Real-time embedding (rtwm/embedder.py)
+------------------------------------------
+* process(block): mixes pre-generated frame chips into the host audio.
+* Level policy per block: -20 dB below host RMS, raised toward the host's
+  in-band RMS when the hop band is busy (masking), capped at -12 dB,
+  clip-limited, and gated in near-silence (< -80 dBFS).
+* Frame generation costs ~1 ms per 0.81 s frame (real-time with huge margin).
 
-──────────────────────────────────────────────────────────────────────────────
-3. Tamper‑Response Matrix
-──────────────────────────────────────────────────────────────────────────────
-| Attack / anomaly          | Detector symptom                   | Failing step |
-|---------------------------|------------------------------------|--------------|
-| Low‑pass filter ≤ 4 kHz   | No correlation peaks > τ           | Band scan    |
-| Lossy MP3 128 kbps        | Peaks found, but LLR too low ⇒ CRC | Polar decode |
-| Heavy Gaussian noise      | Corr σ ↑, τ ↑ ⇒ peaks lost         | Sync         |
-| Hard clipping (>0 dBFS)   | PN sign flips → wrong LLR signs    | Polar decode |
-| Speed change +3 %         | Frame mis‑alignment; wide Δ=200    | Window search (may still succeed) |
-| Drop 1 s middle segment   | Counter jump ⇒ mismatch            | Frame check  |
-| Splice different session  | Nonce differs ⇒ reject             | Nonce check  |
-| Full watermark removal    | No peaks at any band               | Early exit   |
+4. Offline detection (rtwm/detector.py)
+----------------------------------------
+Per band: resample to 48 kHz -> band-pass -> normalised correlation against
+the (TX+RX filtered) preamble template -> coherent integrate-and-dump demod
+(channel phase estimated from the preamble; polarity inversion is absorbed)
+-> header majority vote gives the frame counter -> PN despread -> LLRs ->
+CA-SCL polar decode with AEAD-open as validator -> decrypt, check magic and
+counter, extract session nonce.
 
-──────────────────────────────────────────────────────────────────────────────
-4. Crypto Summary
-──────────────────────────────────────────────────────────────────────────────
-* **Symmetric key**: 256‑bit random (user supplied).
-* **AEAD**: XChaCha20‑Poly1305 (IETF draft‑10).
-* **PRNG**: AES‑CTR with BLAKE2s‑derived 128‑bit key.
-* **Hop schedule**: HMAC‑SHA256(key, frame_ctr) % 4.
+5. Verdict logic (WatermarkDetector.analyze -> Report)
+-------------------------------------------------------
+Decoded frames are cryptographically genuine; tampering is judged on
+consistency:
+  * session nonce must be identical across frames        (splice)
+  * no counter may repeat                                (replay / copy-paste)
+  * position deltas must equal counter deltas            (cut / insert, >=21 ms,
+    including surgical removal of whole frames at exact boundaries)
+  * >=2-frame holes in an otherwise healthy timeline     (same-length
+    replacement, e.g. AI dub) -> unverified_spans
+  * decoded frames must match their reconstructed TX waveform in ~21 ms
+    windows (two-metric check)                           (sub-frame edits)
+  * a single missing frame between healthy neighbours triggers
+    erasure-assisted re-decoding: dead symbol runs are located by data-free
+    BPSK coherence, erased, and the decoder retried; success authenticates
+    the rest of the frame and pinpoints the edit.
+Missing frames on a uniformly degraded channel (codec band-kill, noise) are
+reported as unverified spans but are NOT tampering by themselves.
 
-All cryptographic operations rely on `cryptography` ≥ 42.0; AES may fall back
-to PyCryptodome when present.
+Verdicts: authentic | tampered (any issue) | no-watermark (nothing decodes:
+absent mark, wrong key, or forged mark - forgery cannot pass AEAD).
 
-──────────────────────────────────────────────────────────────────────────────
-5. DSP Constants
-──────────────────────────────────────────────────────────────────────────────
-* Sample rate …………………… 48 000 Hz
-* Frame length ………………… 1087 chips (63 + 1024)
-* Block size (PortAudio) …… 1024 samples (≈ 21 ms)
-* Watermark level ………… −20 dBFS relative
-* Corr threshold factor …… 8× σ
-* List decoder size ……… 8
-* CRC size …………………… 8 bits
+6. Known limits (by design / future work)
+------------------------------------------
+* Detection floor: cuts/inserts >=21 ms; same-length replacements >= ~30-60 ms.
+* True silence carries no watermark (silence gate): unverifiable by physics.
+* Over-the-air capture (reverb, clock drift) and real codec round-trips are
+  not yet validated; multiband redundancy per frame and psychoacoustic
+  shaping are the designed next steps.
+
+Tests: tests/ - unit (crypto, polar, utils, filter), component (embedder,
+detector), scenario e2e (clean / cut / AI replacement / word swap).  All fast;
+no test exceeds ~15 s.

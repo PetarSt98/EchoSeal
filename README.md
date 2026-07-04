@@ -1,187 +1,107 @@
-# 🔊 EchoSeal — Real‑Time Ultrasonic Audio Watermarking
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/) 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) 
-[![CI](https://img.shields.io/github/actions/workflow/status/your-org/EchoSeal/test.yml?branch=main)](https://github.com/your-org/EchoSeal/actions) 
-[![PyPI](https://img.shields.io/pypi/v/echoseal)](https://pypi.org/project/echoseal/) 
-[![Coverage](https://img.shields.io/codecov/c/github/your-org/EchoSeal)](https://codecov.io/gh/your-org/EchoSeal)
+# EchoSeal
 
-> **EchoSeal** hides an **AES‑encrypted, Polar‑coded fingerprint** in ultrasonic
-> frequencies (4–22 kHz).  
-> In < 50 ms it watermarks live speech, and a 3 s smartphone recording can prove authenticity or reveal tampering.
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+Real-time audio watermarking for speech. Embed a cryptographic mark while recording; verify any clip later and get **authentic**, **tampered**, or **no watermark** — with time ranges when something was edited.
+
+The mark sits in the 4–22 kHz band, mixed below speech level. Each ~0.8 s frame is self-contained, so a few seconds of audio is enough to check.
 
 ---
 
-## 📚 Table of Contents
-1. [Why EchoSeal?](#-why-echoseal)
-2. [Feature Matrix](#-feature-matrix)
-3. [Quick Start](#-quick-start)
-4. [How It Works](#-how-it-works)
-5. [Technical Details](#-technical-details)
-6. [Screenshots](#-screenshots)
-7. [Compatibility](#-compatibility)
-8. [Roadmap](#-roadmap)
-9. [Project Layout](#-project-layout)
-10. [Contributing](#-contributing)
-11. [Security Model](#-security-model)
-12. [License](#-license)
-13. [Citation](#-citation)
+## Idea
+
+```
+  live speech  →  embedder (TX)  →  watermarked audio  →  file / broadcast
+                                                          ↓
+                                              detector (RX)  →  verdict + issues
+```
+
+**TX** mixes an inaudible BPSK carrier into the audio stream in real time.  
+**RX** finds frames, decrypts them, then checks that counters, timing, and waveforms all agree.
 
 ---
 
-## ❓ Why EchoSeal?
-* **Tamper evidence** – Detect deep‑fake edits, splices and EQ tricks.
-* **Zero workflow impact** – Just run a background TX app while recording.
-* **Open & auditable** – MIT‑licensed Python, < 1 kLOC.
-* **Runs everywhere** – Desktop, Raspberry Pi, Docker, headless servers.
+## Quick start
 
----
+Requires Python 3.12+ and a working microphone for live TX.
 
-## 🚀 Feature Matrix
-|   | Capability | Notes |
-|---|------------|-------|
-| 🎙 | **Real‑time transmitter** | < 50 ms loop latency |
-| 🔐 | **XChaCha20‑Poly1305** | 256‑bit key, 192‑bit nonce |
-| 🛰 | **Frequency‑hopping DSSS** | 4 secret sub‑bands, keyed HMAC schedule |
-| 📶 | **Polar (1024/448) + CRC‑8** | SCL‑8 decoder, 4.2 dB coding gain |
-| 🧭 | **Smart sync** | 63‑chip MLS + ±200‑frame fallback |
-| 🗜 | **Compression resilience** | Survives MP3 128 kbps ✓ |
-| ↻ | **Replay defence** | 8‑byte session nonce & frame counter |
-| 🖥 | **GUI & CLI** | `echoseal‑tx`, `echoseal‑rx` |
-| 🐳 | **Docker demo** | `docker run --device /dev/snd echoseal` |
-
----
-
-## ⚡ Quick Start
-
-### ☁️ Install from PyPI
 ```bash
-python -m pip install echoseal           # requires Python ≥ 3.10
+git clone <repo-url> && cd EchoSeal
+pip install -e ".[dev]"
+
+# 256-bit key (64 hex chars)
+export KEY=$(openssl rand -hex 32)
+
+# Watermark from the mic for 30 s (optional: --save out.wav)
+echoseal-tx --key $KEY --seconds 30
+
+# Verify a recording
+echoseal-rx --key $KEY --audio recording.wav
 ```
 
-### 🎙️ Embed a live watermark
+Exit codes from `echoseal-rx`: `0` authentic · `1` tampered · `2` no watermark.
+
+**Docker** (verify only needs a mounted file):
+
 ```bash
-# Generate a 256‑bit random key and start TX for 30 s
-export ES_KEY=$(openssl rand -hex 32)
-echoseal-tx --key $ES_KEY --seconds 30
+docker build -t echoseal .
+docker run --rm -v "$PWD:/data" echoseal echoseal-rx --key $KEY --audio /data/recording.wav
 ```
 
-### 🔎 Verify any WAV/FLAC/AIFF (44 100 Hz or 48 000 Hz)
+---
+
+## What the detector checks
+
+| Verdict | Meaning |
+|---------|---------|
+| `authentic` | Frames decode under your key; timeline and waveforms are consistent |
+| `tampered` | Mark is present but something does not add up (see issues printed) |
+| `no-watermark` | Nothing decodable — no mark, wrong key, or too degraded |
+
+Tampering signals include cuts and inserts, spliced sessions, replayed frames, same-length replacements (e.g. dubbed words), and sub-frame edits. A watermark forged with another key never passes decryption.
+
+---
+
+## Stack (short)
+
+- ChaCha20-Poly1305 payload + HKDF sub-keys (AEAD, PN, band hop)
+- Polar code 1024/448, SCL decode
+- Frequency-hopping BPSK in one of four sub-bands per frame
+- 63-chip MLS preamble, 48 kHz, ~0.81 s per frame
+
+More detail: [`EchoSeal_algorithm_summary.txt`](EchoSeal_algorithm_summary.txt).
+
+---
+
+## Project layout
+
+```
+rtwm/           core library (embedder, detector, crypto, polar, frame format)
+tx_app.py       live transmitter CLI  →  echoseal-tx
+rx_app.py       offline verifier CLI  →  echoseal-rx
+tests/          pytest (unit + e2e scenarios)
+gui/            optional TX/RX GUIs
+```
+
+---
+
+## Tests
+
 ```bash
-echoseal-rx --key $ES_KEY path/to/recording.wav
+pytest                          # full suite
+pytest --ignore=tests/test_e2e.py   # unit / component only
+pytest tests/test_e2e.py        # scenario tests (cut, insert, AI swap, …)
 ```
 
 ---
 
-## 🧠 How It Works
-```mermaid
-flowchart LR
-    subgraph TX
-        mic[🎤 Microphone] --> enc["Encrypt + Polar"] --> hop["Freq‑hop PN spread"] --> spk[🔊 Speaker]
-    end
-    spk -.acoustic wave.-> rec[📱 Field recording]
-    subgraph RX
-        rec --> bp[Band‑pass] --> corr[Correlation sync] --> llr[Soft LLR] --> dec["Polar SCL‑8"] --> aead[XChaCha20 verify] --> verdict{✅ Authentic?}
-    end
-```
+## Status
+
+Early research prototype. Validated on synthetic speech and controlled edits in tests. **Not yet** benchmarked for real room capture, phone microphones, or codec chains (MP3/AAC). Silence carries no mark by design.
 
 ---
 
-## 🔬 Technical Details
-* **Watermark frame** – 63‑chip MLS preamble + 1024 BPSK chips (448‑bit payload).  
-* **Payload** – `"ESAL"` magic • 32‑bit frame counter • 64‑bit session nonce • AEAD tag.  
-* **Spreading** – DSSS with per‑frame AES‑CTR PN; gain ≈ 31 dB.  
-* **Hopping** – HMAC‑SHA256(key, ctr) selects one sub‑band per frame.  
-* **Detection threshold** – 8 × σ of correlation peaks (adaptive CFAR).  
-* **Target watermark level** – −20 dB re speech RMS (psycho‑acoustic masking).  
+## License
 
-For a full white‑paper see [`docs/spec.pdf`](docs/spec.pdf).
-
----
-
-## 📸 Screenshots
-| Transmitter | Verifier |
-|-------------|----------|
-| <img src="docs/screenshot_tx_gui.png" width="380"/> | <img src="docs/screenshot_rx_gui.png" width="380"/> |
-
----
-
-## 🖥 Compatibility
-| OS | TX | RX |
-|----|----|----|
-| Linux (Pulse/ALSA) | ✅ | ✅ |
-| macOS 12+ | ✅ | ✅ |
-| Windows 10+ | ⚠️ (ASIO advised) | ✅ |
-| Raspberry Pi 4 (64‑bit) | ✅ | ✅ |
-
-Hardware: standard laptop speakers & mics down to −20 dBFS @ 18–22 kHz.
-
----
-
-## 🛣 Roadmap
-- [ ] Public‑key signature payload (anyone can verify).  
-- [ ] Adaptive psycho‑acoustic embed level.  
-- [ ] Cython fast‑path for Raspberry Pi Zero.  
-- [ ] Android TX companion app.  
-
-See [milestones](https://github.com/your-org/EchoSeal/milestones).
-
----
-
-## 🗂 Project Layout
-```
-echoseal/
-├── audioio.py      ← real‑time PortAudio loop
-├── embedder.py     ← TX engine (hop, PN, Polar)
-├── detector.py     ← RX engine (sync, SCL, AEAD)
-├── crypto.py       ← XChaCha20 + AES‑CTR PN
-├── polar_fast.py   ← fastpolar wrapper
-└── utils.py
-gui/
-    ├── tx_gui.py
-    └── rx_gui.py
-tests/               ← pytest suite
-docs/
-docker/
-```
-
----
-
-## 🤝 Contributing
-1. Fork + clone  
-2. `pip install -e .[dev]`  
-3. `pytest && black . && flake8`  
-4. Open a PR with a concise description.  
-
-All contributors must sign the CLA.
-
----
-
-## 🔒 Security Model
-EchoSeal assumes the attacker **cannot obtain the secret key** used during TX.  
-Threats addressed:
-
-* Lossy re‑encoding (MP3/AAC), EQ filtering, resampling  
-* Splicing two recordings (nonce mismatch)  
-* Time‑scale modifications ±5 %  
-* Noise injection up to −15 dB SNR  
-
-Out of scope: analogue attacks that low‑pass everything above 4 kHz and human transcription/re‑speech.
-
----
-
-## ⚖️ License
-MIT © 2025 EchoSeal Team — use it, fork it, star it ⭐
-
----
-
-## 📖 Citation
-If you use EchoSeal in research, please cite:
-
-```
-@misc{EchoSeal2025,
-  title        = {EchoSeal: Real‑Time Ultrasonic Audio Watermarking},
-  author       = {EchoSeal Team},
-  howpublished = {\url{https://github.com/your-org/EchoSeal}},
-  year         = {2025}
-}
-```
+MIT — see [LICENSE](LICENSE).

@@ -1,478 +1,697 @@
 """
-Improved watermark detector with better peak detection and frame handling.
+Offline watermark detector: ingest a recording, return frames and a verdict.
+
+Detection pipeline (per hop band):
+
+    resample to 48 kHz  →  band-pass  →  preamble correlation (sync)  →
+    coherent BPSK demod (channel phase estimated from the preamble)  →
+    header majority vote (frame counter)  →  PN despread  →  LLRs  →
+    CA-SCL polar decode  →  AEAD decrypt + magic/counter verification
+
+Every frame is self-contained, so detection works on any excerpt of a longer
+recording — nothing depends on absolute time or on the talk's beginning being
+present.  Polarity inversion of the recording is absorbed by the phase
+estimate, and the frame counter is recovered from the header rather than from
+the frame's position.
+
+Verdict layer (:meth:`WatermarkDetector.analyze`): decoded frames are
+cryptographically authentic by construction, so tampering is judged on their
+*consistency* — plus a waveform-integrity check inside each decoded frame:
+
+    * all frames must carry the same session nonce      (splice detection)
+    * no frame counter may repeat                       (replay detection)
+    * counter deltas must match position deltas         (cut / insert detection)
+    * holes in an otherwise healthy timeline            (same-length replacement)
+    * decoded frames must match their reconstructed
+      TX waveform window-by-window                      (sub-frame edits)
+    * a single undecodable frame between healthy
+      neighbours gets erasure-assisted re-decoding      (small edits, benign loss)
+
+The waveform check exploits that a decoded frame is fully known: its exact
+transmitted waveform can be regenerated and correlated against the recording
+in ~21 ms windows, localising edits far smaller than a frame.  The recovery
+step distinguishes a benignly lost frame (weak everywhere) from an edited one
+(dead zone inside an otherwise coherent frame) and often re-authenticates the
+untouched remainder of the frame via erasure decoding.  Frames that are
+merely *missing* on a uniformly degraded channel (aggressive codec, heavy
+noise) never count as tampering on their own.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass, field
+
 import numpy as np
-from scipy.signal import lfilter, correlate
-from cryptography.exceptions import InvalidTag
+from scipy.signal import correlate, lfilter
 
-from rtwm.utils       import BAND_PLAN, butter_bandpass, resample_to, choose_band, mseq_63
-from rtwm.crypto      import SecureChannel
-from rtwm.polar_fast  import decode as polar_dec, N_DEFAULT
+from rtwm import frame
+from rtwm.crypto import SecureChannel
+from rtwm.polar_fast import decode as polar_dec, encode as polar_enc
+from rtwm.utils import BAND_PLAN, butter_bandpass, choose_band, resample_to
 
-PRE_BITS   = mseq_63()
-PRE_L      = len(PRE_BITS)
-# Header: 16-bit counter (low bits) repeated 8x => 128 chips
-HDR_BITS   = 16
-HDR_REPEAT = 8
-HDR_L      = 128
-FRAME_LEN  = PRE_L + HDR_L + N_DEFAULT
-TIGHT_DELTA   = 3                                  # ±3 quick search
-WIDE_DELTA    = 200                                # one-time fallback
 EPS = 1e-12
 
-class WatermarkDetector:
-    """Recover EchoSeal watermark from ≥3 s recording."""
+MIN_NCC = 0.18              # absolute floor for preamble correlation peaks
+NCC_MAD_FACTOR = 6.0        # adaptive threshold: median + k * MAD
+MAX_PEAKS_PER_BAND = 24     # sync candidates examined per band
+HEADER_MIN_COHERENCE = 0.55  # within-group sign agreement gate (wrong key ~0.35)
+MAX_CTR_EPOCHS = 2          # counter candidates: lo16 + epoch * 2^16 (~14.6 h each)
+LLR_CLIP = 25.0
 
-    def __init__(self, key32: bytes, *, fs_target: int = 48_000, list_size: int = 256) -> None:
-        self.sec          = SecureChannel(key32)
-        self.fs_target    = fs_target
-        self.session_nonce: bytes | None = None     # 8-byte anti-replay
-        self._band_key = getattr(self.sec, "band_key", key32)
-        self._mf_cache = {}
-        self._list_size = int(list_size)
+# Timeline consistency: tolerate benign channel effects (clock drift, codec
+# delay jitter, smeared sync on heavily attenuated bands) but catch any cut or
+# insert of ~a phoneme or more.  1024 samples = 21 ms at 48 kHz.
+TIMING_JITTER_SAMPLES = 1024
+TIMING_DRIFT_TOLERANCE = 0.01
+
+# Same-length replacements (e.g. an AI-dubbed passage) do not disturb the
+# timeline; their fingerprint is a contiguous run of undecodable frames inside
+# an otherwise healthy timeline.  Runs of >= MIN_GAP_FRAMES missing frames are
+# flagged, but only when the rest of the timeline decodes well — a uniformly
+# harsh channel (aggressive codec, heavy noise) must not be mistaken for
+# tampering.  (Spans are still reported for information either way.)
+# A *single* missing frame is empirically common on benign channels (band-edge
+# codecs), so it is never flagged directly: it triggers erasure-assisted
+# recovery instead (see _recover_single_gaps).
+MIN_GAP_FRAMES = 2
+HEALTHY_COVERAGE = 0.8
+
+# Erasure-assisted recovery of single missing frames.  The frame's expected
+# position and counter are known from its neighbours; dead symbol runs are
+# located with a non-data-aided BPSK coherence metric (|sum z^2| / sum |z|^2,
+# which needs no knowledge of the data bits), padded, erased (LLR = 0) and the
+# polar decoder is retried.  A successful authenticated decode is
+# cryptographic proof that the frame is genuine *except* the erased span ->
+# flagged as a local edit with zero false-positive risk.  If decoding still
+# fails but the dead run is unambiguous (hard-dead inside an otherwise
+# coherent frame), it is flagged on signal evidence.  A frame that is weak
+# *everywhere* (codec band-kill, noise) has no localised dead run and is left
+# as benign degradation.
+RECOVERY_MAX_PER_SCAN = 3
+COHERENCE_WINDOW = 32        # symbols per coherence window (~21 ms)
+COHERENCE_PAD = 16           # symbols of padding around a dead run
+COHERENCE_DEAD_REL = 0.5     # dead: below this fraction of the frame median
+COHERENCE_HARD_DEAD_REL = 0.3  # signal-evidence threshold when decode fails
+COHERENCE_MIN_MEDIAN = 0.5   # below this, the whole frame is unjudgeable
+ERASURE_MAX_SYMBOLS = 512    # beyond this the rate-0.44 code cannot recover
+RECOVERY_SILENCE_RMS = 1e-3  # dead zones this quiet may be the silence gate
+
+# Waveform integrity inside decoded frames: correlate the recording against
+# the reconstructed TX waveform in half-overlapping windows.  Two metrics per
+# window — matched-filter gain (robust to loud host audio) and NCC (robust to
+# quiet-host watermark level dips) — and a window is anomalous only when BOTH
+# collapse relative to the frame's own medians, for >= WAVEFORM_MIN_RUN
+# consecutive windows.  Frames whose overall match is too poor are skipped.
+WAVEFORM_WINDOW_SYMBOLS = 32          # 32 symbols = 1024 samples ~ 21 ms
+WAVEFORM_REL_THRESHOLD = 0.4
+WAVEFORM_MIN_MEDIAN = 0.4
+WAVEFORM_MIN_RUN = 2                  # >= 2 bad windows ~ >= 32 ms edit
+
+
+@dataclass(frozen=True)
+class FrameHit:
+    """One successfully decoded and decrypted watermark frame."""
+
+    start: int                # sample index of the frame in the 48 kHz signal
+    band: tuple[int, int]
+    ctr: int                  # frame counter, verified against the sealed payload
+    nonce: bytes              # 8-byte session nonce from the decrypted payload
+
+
+@dataclass(frozen=True)
+class Report:
+    """Outcome of :meth:`WatermarkDetector.analyze`."""
+
+    hits: list[FrameHit]
+    issues: list[str] = field(default_factory=list)
+    unverified_spans: list[tuple[float, float]] = field(default_factory=list)
+    """(t0, t1) seconds carrying no verifiable watermark inside an otherwise
+    healthy timeline — possible replacement (e.g. AI-generated insert)."""
+
+    @property
+    def verdict(self) -> str:
+        """"authentic" | "tampered" | "no-watermark"."""
+        if not self.hits:
+            return "no-watermark"
+        return "tampered" if self.issues else "authentic"
+
+    @property
+    def coverage(self) -> float:
+        """Fraction of expected frames found between first and last hit."""
+        if not self.hits:
+            return 0.0
+        ctrs = {h.ctr for h in self.hits}
+        span = max(ctrs) - min(ctrs) + 1
+        return len(ctrs) / span
+
+
+class WatermarkDetector:
+    """Recover EchoSeal watermark frames from a recording (offline)."""
+
+    def __init__(
+        self,
+        key32: bytes,
+        *,
+        fs_target: int = 48_000,
+        sps: int = frame.SPS,
+        list_size: int = 8,
+        max_decodes_per_band: int = 8,
+    ) -> None:
+        self.sec = SecureChannel(key32)
+        self.fs = fs_target
+        self.sps = sps
+        self.list_size = list_size
+        self.max_decodes_per_band = max_decodes_per_band
+        self._templates: dict[tuple[int, int], np.ndarray] = {}
 
     # ------------------------------------------------------------------ API
     def verify(self, audio: np.ndarray, fs_in: int) -> bool:
-        signal, _ = resample_to(self.fs_target, audio, fs_in)
-        hop0 = choose_band(self._band_key, 0)
-        print(f"[VERIFY] Trying band {hop0} first")
-        if self._scan_band_multi_frame(signal, hop0):
-            return True
-        for band in [b for b in BAND_PLAN if b != hop0]:
-            if self._scan_band_multi_frame(signal, band):
-                return True
-        return False
+        """True iff the recording carries a watermark and shows no tampering."""
+        return self.analyze(audio, fs_in).verdict == "authentic"
 
-    # ------------------------------------------------------------------ band scan
-    def _scan_band_multi_frame(self, signal: np.ndarray, band) -> bool:
-        # 1) Band-pass once
-        print(f"[SCAN] Band {band}, signal len: {len(signal)}")
-        b, a = butter_bandpass(*band, self.fs_target, order=4)
-        y = lfilter(b, a, signal.astype(np.float32, copy=False))
+    def analyze(self, audio: np.ndarray, fs_in: int) -> Report:
+        """Scan the recording and judge the consistency of the decoded frames."""
+        hits, wf_spans, wf_issues = self._scan_full(audio, fs_in)
+        issues = self._consistency_issues(hits)
+        gap_spans, gap_issues = self._unverified_spans(hits)
+        return Report(
+            hits=hits,
+            issues=issues + gap_issues + wf_issues,
+            unverified_spans=sorted(gap_spans + wf_spans),
+        )
 
-        # 2) Filtered preamble template (zero-state), unit-normalize
-        pre_sy = 2.0 * PRE_BITS.astype(np.float32) - 1.0
-        tpl = lfilter(b, a, pre_sy)
-        tpl_norm = float(np.sqrt(np.sum(tpl * tpl)) + 1e-12)
-        tpl = tpl / tpl_norm
+    def scan(self, audio: np.ndarray, fs_in: int) -> list[FrameHit]:
+        """Return all decodable frames, sorted by position (no dedup: a
+        repeated counter is evidence, not noise)."""
+        return self._scan_full(audio, fs_in)[0]
 
+    def _scan_full(
+        self, audio: np.ndarray, fs_in: int
+    ) -> tuple[list[FrameHit], list[tuple[float, float]], list[str]]:
+        x = np.asarray(audio, dtype=np.float64)
+        if x.ndim == 2:  # downmix stereo recordings
+            x = x.mean(axis=1)
+        signal, _ = resample_to(self.fs, x, int(fs_in))
+
+        hits: list[FrameHit] = []
+        spans: list[tuple[float, float]] = []
+        issues: list[str] = []
+        for band in BAND_PLAN:
+            band_hits, band_spans, band_issues = self._scan_band(signal, band)
+            hits.extend(band_hits)
+            spans.extend(band_spans)
+            issues.extend(band_issues)
+        hits.sort(key=lambda h: h.start)
+
+        # Second pass: single-frame holes between healthy neighbours.
+        n_frame = frame.frame_samples(self.sps)
+        attempts = 0
+        for a, b in list(zip(hits, hits[1:])):
+            if attempts >= RECOVERY_MAX_PER_SCAN:
+                break
+            if b.ctr - a.ctr != 2 or a.nonce != b.nonce:
+                continue
+            if abs((b.start - a.start) - 2 * n_frame) > TIMING_JITTER_SAMPLES:
+                continue  # timeline broken here: the cut/insert check owns it
+            attempts += 1
+            hit, r_spans, r_issues = self._recover_single_gap(signal, a)
+            if hit is not None:
+                hits.append(hit)
+            spans.extend(r_spans)
+            issues.extend(r_issues)
+
+        return sorted(hits, key=lambda h: h.start), spans, issues
+
+    # ------------------------------------------------------- tamper analysis
+    def _consistency_issues(self, hits: list[FrameHit]) -> list[str]:
+        issues: list[str] = []
+        if len(hits) < 2:
+            return issues
+        n_frame = frame.frame_samples(self.sps)
+
+        nonces = {h.nonce for h in hits}
+        if len(nonces) > 1:
+            issues.append(
+                f"{len(nonces)} different session nonces present "
+                "(splice of separate recordings suspected)"
+            )
+
+        seen: dict[int, int] = {}
+        for hit in hits:
+            if hit.ctr in seen:
+                issues.append(
+                    f"frame counter {hit.ctr} appears twice "
+                    f"(t={seen[hit.ctr] / self.fs:.2f}s and t={hit.start / self.fs:.2f}s; "
+                    "copied/replayed audio suspected)"
+                )
+            seen.setdefault(hit.ctr, hit.start)
+
+        for a, b in zip(hits, hits[1:]):
+            if b.ctr <= a.ctr:
+                continue  # repeats already reported; ordering is by position
+            expected = (b.ctr - a.ctr) * n_frame
+            tolerance = max(
+                TIMING_JITTER_SAMPLES, int(TIMING_DRIFT_TOLERANCE * expected)
+            )
+            offset = (b.start - a.start) - expected
+            if abs(offset) > tolerance:
+                what = "missing" if offset < 0 else "inserted"
+                issues.append(
+                    f"~{abs(offset) / self.fs:.2f}s of audio {what} between "
+                    f"frames {a.ctr} and {b.ctr} "
+                    f"(around t={a.start / self.fs:.2f}s; cut/insert suspected)"
+                )
+        return issues
+
+    def _unverified_spans(
+        self, hits: list[FrameHit]
+    ) -> tuple[list[tuple[float, float]], list[str]]:
+        """Contiguous runs of undecodable frames inside a healthy timeline.
+
+        A same-length replacement (AI dub, local wipe) leaves the timeline
+        intact but produces a hole spanning *all* bands.  Spans are always
+        reported; they count as tampering (issues) only when the remaining
+        timeline decodes well, so uniformly degraded channels are not
+        misreported.
+        """
+        if len(hits) < 2:
+            return [], []
+
+        ctrs = sorted({h.ctr for h in hits})
+        gaps = [
+            (a, b, b - a - 1)
+            for a, b in zip(ctrs, ctrs[1:])
+            if b - a - 1 >= MIN_GAP_FRAMES
+        ]
+        if not gaps:
+            return [], []
+
+        # Coverage of the timeline *outside* the candidate holes.  On a poor
+        # channel holes prove nothing, so they stay informational only.
+        span = ctrs[-1] - ctrs[0] + 1
+        missing_in_gaps = sum(g for _, _, g in gaps)
+        healthy = len(ctrs) / max(1, span - missing_in_gaps) >= HEALTHY_COVERAGE
+
+        n_frame = frame.frame_samples(self.sps)
+        by_ctr = {h.ctr: h for h in hits}
+        spans: list[tuple[float, float]] = []
+        issues: list[str] = []
+        for a, b, missing in gaps:
+            t0 = (by_ctr[a].start + n_frame) / self.fs
+            t1 = by_ctr[b].start / self.fs
+            spans.append((t0, t1))
+            if healthy:
+                issues.append(
+                    f"no verifiable watermark between t={t0:.2f}s and t={t1:.2f}s "
+                    f"({missing} frame(s) silent while surrounding audio verifies; "
+                    "replaced or AI-generated segment suspected)"
+                )
+        return spans, issues
+
+    # ------------------------------------------------------------ band scan
+    def _template(self, band: tuple[int, int]) -> np.ndarray:
+        """Unit-norm preamble template as seen after TX *and* RX filtering."""
+        tpl = self._templates.get(band)
+        if tpl is None:
+            b, a = butter_bandpass(*band, self.fs, order=4)
+            tpl = lfilter(b, a, frame.preamble_waveform(band, self.fs, self.sps))
+            tpl = tpl / (np.linalg.norm(tpl) + EPS)
+            self._templates[band] = tpl
+        return tpl
+
+    def _scan_band(
+        self, signal: np.ndarray, band: tuple[int, int]
+    ) -> tuple[list[FrameHit], list[tuple[float, float]], list[str]]:
+        n_frame = frame.frame_samples(self.sps)
+        if signal.size < n_frame:
+            return [], [], []
+
+        b, a = butter_bandpass(*band, self.fs, order=4)
+        y = lfilter(b, a, signal)
+
+        peaks = self._preamble_peaks(y, band, n_frame)
+
+        hits: list[FrameHit] = []
+        spans: list[tuple[float, float]] = []
+        issues: list[str] = []
+        failures = 0  # only unsuccessful decodes count against the budget
+        for peak in peaks:
+            aligned = self._demod_frame(y, peak, band)
+            if aligned is None:
+                continue
+            start, symbols = aligned
+
+            ok, ctr_lo16 = self._header_counter(symbols)
+            if not ok:
+                continue
+
+            for epoch in range(MAX_CTR_EPOCHS):
+                ctr = (epoch << 16) | ctr_lo16
+                if choose_band(self.sec.band_key, ctr) != band:
+                    continue
+                payload = polar_dec(
+                    self._payload_llr(symbols, ctr),
+                    list_size=self.list_size,
+                    validator=self._validator(ctr),
+                )
+                if payload is not None:
+                    plain = self.sec.open(payload)  # re-open: cheap, µs-scale
+                    hits.append(FrameHit(start, band, ctr, plain[8:16]))
+                    wf_spans, wf_issues = self._waveform_anomalies(
+                        y, start, band, ctr, payload
+                    )
+                    spans.extend(wf_spans)
+                    issues.extend(wf_issues)
+                    break
+                failures += 1
+                if failures >= self.max_decodes_per_band:
+                    return hits, spans, issues
+        return hits, spans, issues
+
+    def _preamble_peaks(
+        self, y: np.ndarray, band: tuple[int, int], n_frame: int
+    ) -> list[int]:
+        """Candidate frame starts: peaks of |NCC(y, preamble template)|."""
+        tpl = self._template(band)
         L = tpl.size
         if y.size < L:
-            return False
+            return []
 
-        # 3) Normalized cross-correlation (cosine similarity)
-        y2 = y * y
-        e_y = np.sqrt(np.convolve(y2, np.ones(L, dtype=np.float32), mode='valid')) + 1e-12
-        from scipy.signal import correlate
-        corr = correlate(y, tpl, mode='valid') / e_y  # [-1,1]
-        print(f"[SCAN] Correlation shape: {corr.shape}, max: {np.max(corr):.3f}, min: {np.min(corr):.3f}")
+        corr = correlate(y, tpl, mode="valid", method="fft")
+        csum = np.concatenate(([0.0], np.cumsum(y * y)))
+        energy = np.sqrt(csum[L:] - csum[:-L]) + EPS
+        ncc = np.abs(corr / energy)
 
-        # 4) Adaptive threshold + non-max suppression
-        med = float(np.median(corr))
-        mad = float(np.median(np.abs(corr - med))) + 1e-12
-        thr = med + 4.5 * 1.4826 * mad
-        thr = min(thr, 0.95)
-        min_distance = FRAME_LEN // 2
-        print(f"[SCAN] Threshold: {thr:.3f}, median: {med:.3f}, MAD: {mad:.6f}")
-        peaks = []
-        for i in range(corr.size):
-            if corr[i] < thr:
-                continue
-            lo = max(0, i - min_distance)
-            hi = min(corr.size, i + min_distance + 1)
-            if corr[i] >= corr[lo:hi].max():
-                peaks.append(i)
-        if not peaks:
-            k = min(5, corr.size)
-            peaks = list(np.argsort(corr)[-k:][::-1])
-        print(f"[SCAN] Found {len(peaks)} peaks above threshold")
-        if peaks:
-            print(f"[SCAN] First 5 peak values: {[corr[p] for p in peaks[:5]]}")
-        if not peaks:
-            print(f"[SCAN] No peaks above threshold, using top-K fallback")
-        # 5) Try decode at candidate starts using header-derived counter when possible
-        tried = 0
-        MAX_TRIES = 400  # overall budget per band pass (fast!)
-        PEAK_LIMIT=25
+        med = float(np.median(ncc))
+        mad = float(np.median(np.abs(ncc - med)))
+        thr = max(MIN_NCC, med + NCC_MAD_FACTOR * 1.4826 * mad)
 
-        for peak_idx in peaks[:PEAK_LIMIT]:
-            start = peak_idx
-            if start + FRAME_LEN > y.size:
-                continue
-            frame = y[start:start + FRAME_LEN]
+        candidates = np.flatnonzero(ncc >= thr)
+        if candidates.size == 0:
+            return []
 
-            # --- fast estimate from time index (used if header fails)
-            ctr_est = int(round(start / FRAME_LEN))
-            cand_ctrs: list[int] = []
+        # Greedy non-maximum suppression, strongest first.
+        order = candidates[np.argsort(ncc[candidates])[::-1]]
+        peaks: list[int] = []
+        for idx in order:
+            if all(abs(idx - p) >= n_frame // 2 for p in peaks):
+                peaks.append(int(idx))
+                if len(peaks) >= MAX_PEAKS_PER_BAND:
+                    break
+        return peaks
 
-            # --- (1A) decode header to get ctr_lo16 ---
-            hdr_ok, ctr_lo16, hdr_score = self._decode_header(frame, band)
-            if hdr_ok:
-                lo = max(0, ctr_est - WIDE_DELTA)
-                hi = ctr_est + WIDE_DELTA + 1
-                for ctr in range(lo, hi):
-                    if (ctr & 0xFFFF) == ctr_lo16 and choose_band(self._band_key, ctr) == band:
-                        cand_ctrs.append(ctr)
-                print(f"  Peak@{start}: ctr_est={ctr_est}, hdr_lo16=0x{ctr_lo16:04X}, "
-                      + f"score={hdr_score:.3f}, trying {len(cand_ctrs)} counters (header gated)")
-            else:
-            # Fallback: the old time-based + band-gated window
-                for ctr in range(max(0, ctr_est - TIGHT_DELTA), ctr_est + TIGHT_DELTA + 1):
-                    if choose_band(self._band_key, ctr) == band:
-                        cand_ctrs.append(ctr)
-                if not cand_ctrs:
-                    lo = max(0, ctr_est - WIDE_DELTA)
-                    hi = ctr_est + WIDE_DELTA + 1
-                    for ctr in range(lo, hi):
-                        if choose_band(self._band_key, ctr) == band:
-                            cand_ctrs.append(ctr)
-                print(f"  Peak@{start}: ctr_est={ctr_est}, trying {len(cand_ctrs)} counters "
-                       + f"(±{TIGHT_DELTA} then ±{WIDE_DELTA})")
+    # ---------------------------------------------------------------- demod
+    def _mixer(self, band: tuple[int, int], num: int) -> np.ndarray:
+        fc = frame.carrier_freq(band, self.fs, self.sps)
+        return np.exp(-2j * np.pi * fc * np.arange(num) / self.fs)
 
-            for ctr in cand_ctrs:
-                print(f"  Trying ctr={ctr}")
-                if self._try_decode_frame(frame, ctr):
-                    print(f"  SUCCESS with ctr={ctr}!")
-                    return True
-                tried += 1
-                if tried >= MAX_TRIES:
-                    return False
-        return False
+    def _demod_frame(
+        self, y: np.ndarray, peak: int, band: tuple[int, int]
+    ) -> tuple[int, np.ndarray] | None:
+        """Integrate-and-dump demod with timing refinement.
 
-    def _try_decode_frame(self, frame: np.ndarray, frame_ctr: int) -> bool:
-        """Try to decode a single frame with a specific counter."""
-        print(f"[DECODE DEBUG] Trying frame counter {frame_ctr}")
-        print(f"[DECODE DEBUG] Frame shape: {frame.shape}")
-        print(f"[DECODE DEBUG] Frame[:8]: {frame[:8]}")
-        print(f"[DECODE DEBUG] Frame RMS: {np.sqrt(np.mean(frame ** 2)):.8f}")
-        # First, default PN convention (pn over whole frame, slice payload
-        llr = self._llr(frame, frame_ctr, pn_variant=0)
-        print(f"[DECODE DEBUG] LLR computed, shape: {llr.shape}")
-        print(f"[DECODE DEBUG] LLR[:8]: {llr[:8]}")
-        print(f"[DECODE DEBUG] LLR[-8:]: {llr[-8:]}")
-        # Quality check
+        The sync peak marks the frame *start*, but the double-filtered symbol
+        energy lags it by the TX+RX filter group delay (up to ~1.5 symbols for
+        the 2 kHz bands), so the search runs from -SPS/2 to +2 SPS and picks
+        the offset that maximises preamble coherence.
 
-        print(f"[DECODE DEBUG] LLR std check passed, proceeding to polar decode")
-        def _validator(payload: bytes) -> bool:
-            try:
-                pt = self.sec.open(payload)
-            except Exception:
-                return False
-            if not pt.startswith(b"ESAL"):
-                return False
-            return int.from_bytes(pt[4:8], "big") == frame_ctr
-
-        blob = polar_dec(llr, list_size=self._list_size, validator=_validator)
-        print(f"    LLR[:8]: {llr[:8]}")
-        print(f"    LLR[-8:]: {llr[-8:]}")
-        print(f"    LLR mean: {np.mean(llr):.3f}, std: {np.std(llr):.3f}")
-
-        if blob is None:
-            # Try sign flip
-            blob = polar_dec(-llr, list_size=self._list_size, validator=_validator)
-        if blob is None:
-            # (3) Try alternate PN convention (restart at payload)
-            llr_alt = self._llr(frame, frame_ctr, pn_variant=1)
-            blob = polar_dec(llr_alt, list_size=self._list_size, validator=_validator)
-            if blob is None:
-                blob = polar_dec(-llr_alt, list_size=self._list_size, validator=_validator)
-            if blob is None:
-                print(f"    Polar decode failed")
-                return False
-        print(f"    Blob head (8B): {blob[:8].hex()}")
-
-        print(f"    Polar decode OK, blob len: {len(blob)}")
-        try:
-            plain = self.sec.open(blob)
-            print(f"    Crypto OK, plain len: {len(plain)}; "
-                  f"magic={plain[:4]!r}, ctr={int.from_bytes(plain[4:8], 'big')}")
-        except Exception  as e:
-            if len(blob) >= 4 and blob[:4] == b"ESAL":
-                plain = blob
-                print("    Crypto skipped: payload appears to be PLAINTEXT (legacy mode)")
-            else:
-                head = blob[:8].hex()
-                print(f"    Crypto failed: {type(e).__name__}: {e}; blob[:8]={head}")
-                return False
-
-        if not plain.startswith(b"ESAL"):
-            print(f"    Wrong magic: {plain[:4].hex()}")
-            return False
-
-        embedded_ctr = int.from_bytes(plain[4:8], "big")
-        if embedded_ctr != frame_ctr:
-            print(f"    Counter mismatch: embedded={embedded_ctr}, expected={frame_ctr}")
-            return False
-
-        nonce = plain[8:16]
-        if self.session_nonce and nonce == self.session_nonce:
-            print(f"    SUCCESS - repeat nonce")
-            return True
-        elif self.session_nonce is None:
-            self.session_nonce = nonce
-            print(f"    SUCCESS - new nonce: {nonce.hex()}")
-            return True
-        print(
-            f"    Nonce mismatch: got {nonce.hex()}, expected {self.session_nonce.hex() if self.session_nonce else 'None'}")
-        return False
-
-    def verify_raw_frame(self, signal: np.ndarray) -> bool:
-        if len(signal) == FRAME_LEN:
-            # Try a few likely counters; filter with the corresponding band
-            for ctr in range(4):
-                band = choose_band(self._band_key, ctr)
-                b, a = butter_bandpass(*band, self.fs_target, order=4)
-                y = lfilter(b, a, signal.astype(np.float32, copy=False))
-                if self._try_decode_frame(y, ctr):
-                    return True
-        band = choose_band(self._band_key, 0)
-        return self._scan_band_multi_frame(signal, band)
-
-    def _scan_band(self, signal: np.ndarray, band, skip_filtering=False) -> bool:
-        """Legacy method for compatibility."""
-        return self._scan_band_multi_frame(signal, band)
-
-    # ------------------------------------------------------------------ window search
-    def _try_window(self, frame: np.ndarray, ctr0: int, delta: int) -> bool:
-        """Try different frame counter values within window."""
-        for ctr in range(max(0, ctr0 - delta), ctr0 + delta + 1):
-            if self._try_decode_frame(frame, ctr):
-                return True
-        return False
-
-    # ------------------------------------------------------------------ helpers
-    def _matched_filter_taps(self, band):
-        key = (band[0], band[1], self.fs_target)
-        h = self._mf_cache.get(key)
-        if h is not None:
-            return h
-
-        b, a = butter_bandpass(*band, self.fs_target, order=4)
-
-        # --- build a long enough impulse response to capture IIR memory ---
-        M_base = max(len(a), len(b))
-        # Heuristic: take the larger of 256 samples or 64×(order+1)
-        # (at 48 kHz this is ≳5 ms, enough for a 4th-order BPF tail)
-        M = max(256, M_base * 64)
-
-        imp = np.zeros(M, dtype=np.float32)
-        imp[0] = 1.0
-        g_rx = lfilter(b, a, imp).astype(np.float32)
-
-        # The embedder already band-pass filters the chips with the same IIR.
-        # After we filter the recording once more (`g_rx`), the effective
-        # channel seen by the payload chips is the cascade g_tx ⋆ g_rx.
-        # A proper matched filter must therefore include the transmit filter
-        # as well; otherwise we would leave the asymmetric TX impulse response
-        # in place, which creates significant ISI in the despread sequence.
-        g_tx_rx = np.convolve(g_rx, g_rx, mode="full")
-
-        # --- truncate by energy: keep 99.9% of the cascade energy ---
-        e = g_tx_rx * g_tx_rx
-        c = np.cumsum(e)
-        total = float(c[-1]) + 1e-20
-        idx = int(np.searchsorted(c, 0.999 * total))  # 99.9%
-        g_tx_rx = g_tx_rx[:idx + 1] if idx + 1 < g_tx_rx.size else g_tx_rx
-
-        # Matched filter is time-reverse of the overall channel response
-        h = g_tx_rx[::-1]
-        # Unit-energy normalize
-        h /= (np.sqrt(float(np.sum(h * h))) + 1e-12)
-
-        self._mf_cache[key] = h
-        return h
-
-    def _llr(self, frame: np.ndarray, frame_id: int, pn_variant: int = 0) -> np.ndarray:
+        Returns (refined start, per-symbol soft values) or None if the frame
+        does not fit inside the recording.
         """
-        Produce length-N LLRs for the payload. Steps:
-          1) matched-filter with long cached taps,
-          2) search an integer chip-phase shift using a sign-invariant metric,
-          3) despread with PN at the chosen shift,
-          4) robust LLR normalization.
-        """
-        N = N_DEFAULT
-        # --- PN (payload) per selected variant
-        if pn_variant == 0:
-            # PN generated over full frame; slice the payload part (matches TX)
-            pn_full = self.sec.pn_bits(frame_id, FRAME_LEN)
-            pn_payload = pn_full[PRE_L + HDR_L:]
-        else:
-            # Alternate: PN restarted at payload length only
-            pn_payload = self.sec.pn_bits(frame_id, N_DEFAULT)
-        pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0  # ±1
+        n_frame = frame.frame_samples(self.sps)
+        pre_samples = frame.PRE_LEN * self.sps
+        mixer_pre = self._mixer(band, pre_samples)
 
-        # --- payload segment (skip preamble + header)
-        rx = frame.astype(np.float32, copy=False)
-        payload = rx[PRE_L + HDR_L:]
-        n = min(payload.size, pn_sy.size)
-        if n <= 0:
-            return np.zeros(N, dtype=np.float32)
-        payload = payload[:n]
-        pn_sy = pn_sy[:n]
-
-        # Add this right after: pn_sy = 2.0 * pn_payload.astype(np.float32) - 1.0
-        print(f"[DETECTOR] Frame {frame_id}")
-        print(f"  pn_payload[:32]: {pn_payload[:32]}")
-        print(f"  rx[:8]: {payload[:8]}")
-        print(f"  despread[:8] (before shift search): {(payload[:8] * pn_sy[:8])}")
-
-        # --- matched filter (long, truncated to ~99.9% energy)
-        band = choose_band(self._band_key, frame_id)
-        h = self._matched_filter_taps(band)
-        mf_full = np.convolve(rx, h, mode="full").astype(np.float32, copy=False)
-        offset = len(h) - 1 + PRE_L + HDR_L
-        # (4) wider shift search tied to filter memory
-        MAX_SHIFT = min(n//2, 4*len(h), HDR_L//2)
-        MARGIN = MAX_SHIFT
-        start = max(0, offset - MARGIN)
-        stop = min(mf_full.size, offset + n + MARGIN)
-        mf_win = mf_full[start:stop]
-        base = offset - start  # zero-shift index within mf_win
-
-
-        # --- guard region to avoid preamble tail bias
-        guard = int(max(16, min(64, len(h) // 8)))
-        if guard >= n:
-            guard = max(0, n // 4)
-
-        # --- integer shift search (sign-invariant): maximize mean |despread|
-        best_s = 0
-        best_score = -1.0
-        for s in range(-MAX_SHIFT, MAX_SHIFT + 1):
-            i0 = base + s
-            i1 = i0 + n
-            if i0 < 0 or i1 > mf_win.size:
+        best_score, best_start = -1.0, None
+        for delta in range(-self.sps // 2, 2 * self.sps + 1):
+            start = peak + delta
+            if start < 0 or start + n_frame > y.size:
                 continue
-            a = mf_win[i0:i1]  # length == n
-            b = pn_sy[:n]  # length == n
-            d = a * b
-            score = float(np.mean(np.abs(d[guard:])))  # sign-invariant
+            z_pre = (y[start : start + pre_samples] * mixer_pre)
+            z_pre = z_pre.reshape(frame.PRE_LEN, self.sps).sum(axis=1)
+            score = float(np.abs(np.dot(z_pre, frame.PRE_SYMBOLS)))
             if score > best_score:
-                best_score = score
-                best_s = s
+                best_score, best_start = score, start
+        if best_start is None:
+            return None
 
-        # --- apply the best shift
-        i0 = base + best_s
-        i1 = i0 + n
-        mf_aligned = mf_win[i0:i1]  # length == n
-        despread = mf_aligned * pn_sy[:n]
+        z = (y[best_start : best_start + n_frame] * self._mixer(band, n_frame))
+        z = z.reshape(frame.SYMBOLS_PER_FRAME, self.sps).sum(axis=1)
 
-        # --- after picking best_s, before building despread ---
-        print(f"[LLR ALIGN] best_s={best_s}, n={n}, len(h)={len(h)}, "
-              f"mf_total={mf_full.size}, fixed_slice=[{offset}:{offset + n}] ")
+        # One residual channel phase, estimated from the known preamble.
+        # (A polarity-inverted recording simply shows up as an extra pi.)
+        theta = np.angle(np.dot(z[: frame.PRE_LEN], frame.PRE_SYMBOLS))
+        return best_start, np.real(z * np.exp(-1j * theta))
 
-        # Keep existing code that forms 'despread'...
-        print(f"[LLR ALIGN] aligned_len={despread.size}, guard={guard}")
+    # --------------------------------------------------------------- header
+    def _header_counter(self, symbols: np.ndarray) -> tuple[bool, int]:
+        """Majority-vote the 16 counter bits; gate on within-group coherence."""
+        seg = symbols[frame.PRE_LEN : frame.PRE_LEN + frame.HDR_LEN]
+        hdr_pn = 2.0 * self.sec.pn_bits(0, frame.HDR_LEN).astype(np.float64) - 1.0
+        groups = (seg * hdr_pn).reshape(frame.HDR_BITS, frame.HDR_REPEAT)
 
-        # --- LLR normalization (use tail to estimate mu/sigma)
-        tail = despread[guard:] if despread.size > guard + 8 else despread
-        mu = float(np.mean(tail))
-        llr_raw = despread - mu
+        sums = groups.sum(axis=1)
+        coherence = np.abs(sums) / (np.abs(groups).sum(axis=1) + EPS)
+        if float(np.mean(coherence)) < HEADER_MIN_COHERENCE:
+            return False, 0
 
-        mad = float(np.median(np.abs(tail - float(np.median(tail))))) + 1e-12
-        sigma_mad = 1.4826 * mad
-        sigma_std = float(np.std(tail)) + 1e-12
-        sigma = max(sigma_mad, sigma_std, 0.1)
+        bits = (sums > 0.0).astype(np.uint8)
+        value = int(np.packbits(bits).view(">u2")[0])
+        return True, value
 
-        scale = float(np.clip(2.0 / (sigma * sigma), 0.5, 30.0))
-        llr = np.clip(llr_raw * scale, -12.0, 12.0).astype(np.float32, copy=False)
+    # ---------------------------------------------------------------- LLRs
+    def _payload_llr(
+        self, symbols: np.ndarray, ctr: int, dead: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Despread payload symbols with the frame PN and scale to LLRs.
 
-        tail_zeros = int(np.sum(np.isclose(llr[-64:], 0.0)))
-        print(f"[LLR ALIGN] N={N}, llr_len={llr.size}, tail_zeros_64={tail_zeros}")
+        `dead` (optional bool mask over the 1024 payload symbols) marks
+        erasures: those LLRs are zeroed and excluded from the scaling stats.
+        """
+        pn = self.sec.pn_bits(ctr, frame.SYMBOLS_PER_FRAME)
+        pn_payload = pn[frame.PRE_LEN + frame.HDR_LEN :]
+        despread = symbols[frame.PRE_LEN + frame.HDR_LEN :] * (
+            2.0 * pn_payload.astype(np.float64) - 1.0
+        )
 
-        if llr.size != N:
-            out = np.zeros(N, dtype=np.float32)
-            m = min(llr.size, N)
-            out[:m] = llr[:m]
-            llr = out
-
+        # Robust Gaussian LLR scaling: amplitude from the median magnitude,
+        # noise sigma from the MAD of the magnitude residuals.
+        alive = despread if dead is None else despread[~dead]
+        amp = float(np.median(np.abs(alive)))
+        sigma = 1.4826 * float(np.median(np.abs(np.abs(alive) - amp))) + EPS
+        llr = np.clip(2.0 * amp * despread / (sigma * sigma), -LLR_CLIP, LLR_CLIP)
+        if dead is not None:
+            llr[dead] = 0.0
         return llr
 
-    def _decrypt_blob_fallback(self, blob: bytes):
+    # ------------------------------------------------- single-gap recovery
+    def _recover_single_gap(
+        self, signal: np.ndarray, prev_hit: FrameHit
+    ) -> tuple[FrameHit | None, list[tuple[float, float]], list[str]]:
+        """Diagnose the one missing frame that follows `prev_hit`.
+
+        Counter, band and position are inherited from the healthy neighbours
+        (frame spacing is exact, so no preamble sync is needed — robust even
+        when the edit destroyed the preamble).  Dead symbol runs are located
+        with the data-free BPSK coherence |sum z^2| / sum |z|^2, erased
+        (LLR = 0) and the polar decoder is retried with both phase signs.
         """
-        Try both common AEAD layouts:
-          A) nonce || (ciphertext || tag)
-          B) (ciphertext || tag) || nonce
-        Return (plaintext_bytes, layout_string) on success, or (None, None).
+        n_frame = frame.frame_samples(self.sps)
+        ctr = prev_hit.ctr + 1
+        band = choose_band(self.sec.band_key, ctr)
+        start = prev_hit.start + n_frame
+        if start < 0 or start + n_frame > signal.size:
+            return None, [], []
+
+        # Local band-pass with warm-up padding for the IIR state.
+        pad = min(start, 2048)
+        y = lfilter(
+            *butter_bandpass(*band, self.fs, order=4),
+            signal[start - pad : start + n_frame],
+        )[pad:]
+
+        z = (y * self._mixer(band, n_frame)).reshape(
+            frame.SYMBOLS_PER_FRAME, self.sps
+        ).sum(axis=1)
+
+        # Data-free coherence per 32-symbol window: ~1 for clean BPSK of any
+        # phase/polarity, ~1/sqrt(W) for noise or foreign audio.
+        n_win = frame.SYMBOLS_PER_FRAME // COHERENCE_WINDOW
+        zw = z[: n_win * COHERENCE_WINDOW].reshape(n_win, COHERENCE_WINDOW)
+        coh = np.abs((zw**2).sum(axis=1)) / ((np.abs(zw) ** 2).sum(axis=1) + EPS)
+
+        med = float(np.median(coh))
+        if med < COHERENCE_MIN_MEDIAN:
+            return None, [], []  # weak everywhere: benign degradation
+
+        # Dead runs: consecutive dead windows, padded, merged on overlap.
+        # Each run carries whether any of its windows is hard-dead (strong
+        # signal evidence usable even without a successful erasure decode).
+        dead = coh < COHERENCE_DEAD_REL * med
+        hard = coh < COHERENCE_HARD_DEAD_REL * med
+        runs: list[list[int | bool]] = []  # [sym0, sym1, hard_dead]
+        for w in np.flatnonzero(dead):
+            s0 = max(0, int(w) * COHERENCE_WINDOW - COHERENCE_PAD)
+            s1 = min(
+                frame.SYMBOLS_PER_FRAME, (int(w) + 1) * COHERENCE_WINDOW + COHERENCE_PAD
+            )
+            if runs and s0 <= runs[-1][1]:
+                runs[-1][1] = s1
+                runs[-1][2] = runs[-1][2] or bool(hard[w])
+            else:
+                runs.append([s0, s1, bool(hard[w])])
+
+        # Erasure decode: phase from the coherent part (z^2 halves the angle,
+        # with an unavoidable pi ambiguity -> try both LLR signs).
+        sym_dead = np.zeros(frame.SYMBOLS_PER_FRAME, dtype=bool)
+        for s0, s1, _ in runs:
+            sym_dead[s0:s1] = True
+        payload_dead = sym_dead[frame.PRE_LEN + frame.HDR_LEN :]
+
+        hit = None
+        if int(payload_dead.sum()) <= ERASURE_MAX_SYMBOLS:
+            theta = 0.5 * np.angle(np.sum(z[~sym_dead] ** 2))
+            symbols = np.real(z * np.exp(-1j * theta))
+            llr = self._payload_llr(symbols, ctr, dead=payload_dead)
+            for sign in (1.0, -1.0):
+                payload = polar_dec(
+                    sign * llr, list_size=self.list_size, validator=self._validator(ctr)
+                )
+                if payload is not None:
+                    plain = self.sec.open(payload)
+                    hit = FrameHit(start, band, ctr, plain[8:16])
+                    break
+
+        spans: list[tuple[float, float]] = []
+        issues: list[str] = []
+        for s0, s1, hard_dead in runs:
+            if hit is None and not hard_dead:
+                continue  # ambiguous: neither crypto proof nor strong evidence
+            zone = signal[start + s0 * self.sps : start + s1 * self.sps]
+            if float(np.sqrt(np.mean(zone**2))) < RECOVERY_SILENCE_RMS:
+                continue  # silence-gated by the embedder: legitimately unmarked
+            t0 = (start + s0 * self.sps) / self.fs
+            t1 = (start + s1 * self.sps) / self.fs
+            spans.append((t0, t1))
+            confirmation = (
+                "rest of frame authenticated" if hit is not None
+                else "frame otherwise coherent"
+            )
+            issues.append(
+                f"watermark absent between t={t0:.2f}s and t={t1:.2f}s inside "
+                f"frame {ctr} ({confirmation}; local edit suspected)"
+            )
+        return hit, spans, issues
+
+    # ------------------------------------------------------ waveform check
+    def _waveform_anomalies(
+        self,
+        y: np.ndarray,
+        start: int,
+        band: tuple[int, int],
+        ctr: int,
+        payload: bytes,
+    ) -> tuple[list[tuple[float, float]], list[str]]:
+        """Sub-frame integrity check on a *decoded* frame.
+
+        Every bit of a decoded frame is known, so its exact transmitted
+        waveform (in-phase and quadrature, making the check channel-phase
+        invariant) is reconstructed, aligned to the recording, and compared in
+        half-overlapping ~21 ms windows using two metrics:
+
+        * matched-filter gain — insensitive to loud host audio on top of the
+          watermark, but dips where the embedder mixed at a low level;
+        * normalised correlation — insensitive to the mixing level, but dips
+          where the host is locally loud.
+
+        Only windows where BOTH collapse (for >= WAVEFORM_MIN_RUN consecutive
+        windows) are flagged: that happens when the watermark is genuinely
+        absent, i.e. the audio was locally replaced.
         """
-        # A) nonce at the front (what crypto.SecureChannel.seal() returns)
-        if len(blob) >= 12:
-            nonce_a = blob[:12]
-            body_a = blob[12:]
-            try:
-                pt = self.sec.open(blob)  # this is exactly (nonce_a || body_a)
-                return pt, "nonce-front"
-            except InvalidTag:
-                pass
+        pn = self.sec.pn_bits(ctr, frame.SYMBOLS_PER_FRAME)
+        symbols = frame.assemble_symbols(
+            ctr,
+            polar_enc(payload),
+            self.sec.pn_bits(0, frame.HDR_LEN),
+            pn[frame.PRE_LEN + frame.HDR_LEN :],
+        )
+        b, a = butter_bandpass(*band, self.fs, order=4)
+        ref_i = lfilter(b, a, frame.modulate(symbols, band, self.fs, self.sps))
+        ref_q = lfilter(
+            b, a,
+            frame.modulate(symbols, band, self.fs, self.sps, phase=-np.pi / 2),
+        )
+        n = ref_i.size
 
-        # B) nonce at the end (some earlier/alt implementations)
-        if len(blob) >= 12:
-            nonce_b = blob[-12:]
-            body_b = blob[:-12]
-            try:
-                pt = self.aead.decrypt(nonce_b, body_b, None)  # same aead the SecureChannel uses
-                return pt, "nonce-tail"
-            except InvalidTag:
-                pass
-
-        return None, None
-
-
-    # ----------------------------- header decode -----------------------------
-    def _decode_header(self, frame: np.ndarray, band) -> tuple[bool, int, float]:
-        """
-        Recover 16 LSBs of frame counter from the header (16 bits, repeated 8x).
-        Returns (ok, ctr_lo16, score).
-        """
-
-        # Header chips (just after preamble)
-        seg = frame[PRE_L:PRE_L + HDR_L].astype(np.float32, copy=False)
-
-        if seg.size < HDR_L:
-            return False, 0, 0.0
-
-        # PN for header: fixed (counter-independent)
-        hdr_pn = 2.0 * self.sec.pn_bits(0, HDR_L).astype(np.float32) - 1.0
-
-        # Align using the same matched-filter taps as payload (robust to room tail)
-        h = self._matched_filter_taps(band)
-        mf = np.convolve(seg, h, mode="full").astype(np.float32, copy=False)
-        offset = len(h) - 1
-        MAX_SHIFT = min(seg.size // 2, 4 * len(h))
-        start = max(0, offset - MAX_SHIFT)
-        stop = min(mf.size, offset + seg.size + MAX_SHIFT)
-        mf_win = mf[start:stop]
-        base = offset - start
-
-        guard = int(max(8, min(32, len(h) // 8)))
-        best_s, best_score = 0, -1.0
-
-        for s in range(-MAX_SHIFT, MAX_SHIFT + 1):
-            i0, i1 = base + s, base + s + seg.size
-
-            if i0 < 0 or i1 > mf_win.size:
+        # Global alignment: the demod start absorbs the filter group delay,
+        # while the reconstruction starts from zero state.
+        best_score, best_d = -1.0, None
+        for d in range(-2 * self.sps, 2 * self.sps + 1):
+            s0 = start + d
+            if s0 < 0 or s0 + n > y.size:
                 continue
-            a = mf_win[i0:i1]
-            score = float(np.mean(np.abs(a[guard:] * hdr_pn[guard:])))
-
+            seg = y[s0 : s0 + n]
+            score = np.hypot(float(np.dot(ref_i, seg)), float(np.dot(ref_q, seg)))
             if score > best_score:
-                best_score, best_s = score, s
-        i0, i1 = base + best_s, base + best_s + seg.size
-        a = mf_win[i0:i1]
-        d = a * hdr_pn
+                best_score, best_d = score, d
+        if best_d is None:
+            return [], []
+        seg = y[start + best_d : start + best_d + n]
 
-        # Majority over 8-chip groups -> 16 bits (MSB-first)
-        sums = d.reshape(HDR_BITS, HDR_REPEAT).sum(axis=1)
-        bits = (sums > 0.0).astype(np.uint8)
-        margin = np.mean(np.abs(sums)) / (np.sqrt(np.mean(d*d)) + 1e-12)
-        val = 0
+        win = WAVEFORM_WINDOW_SYMBOLS * self.sps
+        hop = win // 2
+        gain, ncc = [], []
+        for i in range(0, n - win + 1, hop):
+            s = seg[i : i + win]
+            ri, rq = ref_i[i : i + win], ref_q[i : i + win]
+            ei = np.linalg.norm(ri) + EPS
+            eq = np.linalg.norm(rq) + EPS
+            es = np.linalg.norm(s) + EPS
+            m = np.hypot(float(np.dot(ri, s)) / ei, float(np.dot(rq, s)) / eq)
+            gain.append(m / ((ei + eq) / 2.0))  # watermark amplitude estimate
+            ncc.append(m / es)
+        gain_arr, ncc_arr = np.asarray(gain), np.asarray(ncc)
 
-        for b in bits:
-            val = (val << 1) | int(b)
+        med_gain = float(np.median(gain_arr))
+        med_ncc = float(np.median(ncc_arr))
+        if med_ncc < WAVEFORM_MIN_MEDIAN or med_gain < EPS:
+            return [], []  # channel too poor to judge sub-frame integrity
 
-        # score proxy: normalized mean absolute per bit
-        score = float(np.mean(np.abs(sums)) / (np.std(d) + EPS))
-        ok = (np.count_nonzero(sums > 0) >= 10) and (margin > 0.5)
+        bad = (gain_arr < WAVEFORM_REL_THRESHOLD * med_gain) & (
+            ncc_arr < WAVEFORM_REL_THRESHOLD * med_ncc
+        )
+        if not bad.any():
+            return [], []
 
-        return ok, val, score
+        # Merge consecutive bad windows into spans (in seconds).
+        spans: list[tuple[float, float]] = []
+        issues: list[str] = []
+        idx = np.flatnonzero(bad)
+        run_start = prev = idx[0]
+        for i in list(idx[1:]) + [None]:  # sentinel flushes the last run
+            if i is not None and i == prev + 1:
+                prev = i
+                continue
+            if prev - run_start + 1 >= WAVEFORM_MIN_RUN:
+                t0 = (start + best_d + run_start * hop) / self.fs
+                t1 = (start + best_d + prev * hop + win) / self.fs
+                spans.append((t0, t1))
+                issues.append(
+                    f"watermark waveform breaks inside frame {ctr} between "
+                    f"t={t0:.2f}s and t={t1:.2f}s (local edit suspected)"
+                )
+            if i is not None:
+                run_start = prev = i
+        return spans, issues
+
+    # ------------------------------------------------------------ validator
+    def _validator(self, ctr: int):
+        """AEAD open + magic + counter match: the final decode arbiter."""
+
+        def validate(payload: bytes) -> bool:
+            try:
+                plain = self.sec.open(payload)
+            except Exception:
+                return False
+            return plain[:4] == b"ESAL" and int.from_bytes(plain[4:8], "big") == ctr
+
+        return validate

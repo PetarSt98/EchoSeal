@@ -15,14 +15,14 @@ license         = { text = "MIT" }
 requires-python = ">=3.12"
 
 # ------------- runtime dependencies --------------------------------------
+# NB: the polar codec lives in-tree (rtwm.fastpolar); no external FEC package.
+#     tkinter ships with CPython (apt: python3-tk) and is not a pip dependency.
 dependencies = [
   "numpy>=1.25",
   "scipy>=1.11",
   "sounddevice>=0.4",
   "soundfile>=0.12",
-  "cryptography>=42.0",        # XChaCha20 and AES
-  "fastpolar>=0.3.1",          # fast SC & SCL dec
-  "tkinter; sys_platform == 'linux'",  # GUI support for Linux
+  "cryptography>=42.0",        # ChaCha20-Poly1305 AEAD + AES-CTR PN
 ]
 
 # ------------- optional / dev extras -------------------------------------
@@ -38,8 +38,10 @@ dev = [
 ]
 
 # ------------- console entry-points --------------------------------------
-#  After install, you can run `rtwm-tx` or `rtwm-rx` from the shell.
+#  After install, run `echoseal-tx` / `echoseal-rx` (or the `rtwm-*` aliases).
 [project.scripts]
+echoseal-tx = "tx_app:main"
+echoseal-rx = "rx_app:main"
 rtwm-tx = "tx_app:main"
 rtwm-rx = "rx_app:main"
 
@@ -68,8 +70,9 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = "-ra -q --strict-markers"
-testpaths = [
-    "tests",
+testpaths = ["tests"]
+markers = [
+    "slow: end-to-end tests (detector / full round-trip) that take minutes to run",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

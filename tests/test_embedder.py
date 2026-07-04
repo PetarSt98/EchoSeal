@@ -1,14 +1,12 @@
 import numpy as np
 import pytest
-from scipy.signal import lfilter
 
-from rtwm.embedder import WatermarkEmbedder, TxParams
-from rtwm.utils import choose_band, butter_bandpass
+from rtwm import frame
 from rtwm.crypto import SecureChannel
-from rtwm.polar_fast import encode as polar_enc
+from rtwm.embedder import MIX_HEADROOM, TxParams, WatermarkEmbedder
+from rtwm.utils import choose_band
 
 EPS = 1e-12
-STEADY_OFFSET = 16  # must match embedder steady-state energy window
 
 
 @pytest.fixture
@@ -17,174 +15,125 @@ def key():
 
 
 @pytest.fixture
-def params():
-    # Use defaults from code (fs=48k, N/K from polar layer)
-    return TxParams()
+def tx(key):
+    return WatermarkEmbedder(key)
 
 
-def _manual_frame_chips_exact(tx: WatermarkEmbedder, payload: bytes) -> np.ndarray:
-    """
-    Exact re-implementation of WatermarkEmbedder._make_frame_chips()
-    using *the same* session state and configuration.
-    Differences vs older test:
-      - Uses MLS(63) preamble like the embedder (not params.preamble)
-      - Uses zero-state IIR with the *same dtype* for zi
-      - Normalizes on steady-state part chips[16:], not full frame
-    """
-    band = choose_band(tx.sec.master_key, tx.frame_ctr)
-
-    # Polar encode to 1024 bits
-    data_bits = polar_enc(payload, N=tx.p.N, K=tx.p.K)
-
-    # Build PN for whole frame and slice payload part
-    pre_bits = tx.mseq_63()
-    frame_len = pre_bits.size + data_bits.size
-    pn_full = tx.sec.pn_bits(tx.frame_ctr, frame_len)
-    pn_payload = pn_full[pre_bits.size:]
-
-    # Map to BPSK and spread payload
-    pre_sy = 2.0 * pre_bits.astype(np.float32) - 1.0
-    data_sy = 2.0 * data_bits.astype(np.float32) - 1.0
-    pn_sy   = 2.0 * pn_payload.astype(np.float32) - 1.0
-    symbols = np.concatenate((pre_sy, data_sy * pn_sy))
-
-    # Filter with zero initial state, matching embedder dtype
-    b, a = butter_bandpass(*band, tx.p.fs, order=4)
-    zi_len = max(len(a), len(b)) - 1
-    zi = np.zeros(zi_len, dtype=np.result_type(a, b, symbols))
-    chips, _ = lfilter(b, a, symbols, zi=zi)
-
-    # Normalize using steady-state energy (avoid initial transient)
-    steady = chips[STEADY_OFFSET:] if chips.size > STEADY_OFFSET else chips
-    energy = float(np.mean(steady ** 2))
-    if energy > EPS:
-        chips /= np.sqrt(energy)
-
-    return chips.astype(np.float32)
+def test_frame_has_expected_length(tx):
+    chips = tx._make_frame_chips()
+    assert chips.shape == (frame.frame_samples(tx.p.sps),)
+    assert chips.dtype == np.float32
 
 
-def test_manual_matches_embedder_exact(key, params):
-    """_make_frame_chips must match a manual reimplementation *bit-for-bit (float)* when using the same payload."""
-    tx = WatermarkEmbedder(key, params)
-    tx.frame_ctr = 0  # force known frame
-
-    # Freeze the payload so both paths use identical bits
-    payload = tx._build_payload()
-    tx._build_payload = lambda: payload
-
-    emb_chips = tx._make_frame_chips()
-    man_chips = _manual_frame_chips_exact(tx, payload)
-
-    assert emb_chips.shape == man_chips.shape
-    assert np.allclose(emb_chips, man_chips, atol=1e-6), "Embedder diverged from exact manual implementation"
+def test_frame_is_unit_rms_steady_state(tx):
+    steady = tx._make_frame_chips()[4 * tx.p.sps :]
+    assert abs(float(np.sqrt(np.mean(steady**2))) - 1.0) < 5e-3
+    assert abs(float(np.mean(steady))) < 5e-3
 
 
-def test_frame_counter_ownership(key, params):
-    """_make_frame_chips() must NOT increment the counter; process() *does*."""
-    tx = WatermarkEmbedder(key, params)
+def test_frame_starts_with_preamble_waveform(tx):
+    """The frame prefix must equal the shared preamble template (up to scale)."""
+    tx.frame_ctr = 3
+    chips = tx._make_frame_chips()
+    band = choose_band(tx.sec.band_key, tx.frame_ctr)
+    tpl = frame.preamble_waveform(band, tx.p.fs, tx.p.sps)
+
+    prefix = chips[: tpl.size].astype(np.float64)
+    ncc = np.dot(prefix, tpl) / (np.linalg.norm(prefix) * np.linalg.norm(tpl) + EPS)
+    assert ncc > 0.999
+
+
+def test_frame_energy_is_confined_to_hop_band(tx):
+    """Spectral shaping: most frame energy must sit inside the chosen band."""
+    for ctr in range(4):
+        tx.frame_ctr = ctr
+        chips = tx._make_frame_chips().astype(np.float64)
+        lo, hi = choose_band(tx.sec.band_key, ctr)
+
+        spec = np.abs(np.fft.rfft(chips)) ** 2
+        freqs = np.fft.rfftfreq(chips.size, 1.0 / tx.p.fs)
+        in_band = spec[(freqs >= lo - 500) & (freqs <= hi + 500)].sum()
+        assert in_band / spec.sum() > 0.7, f"ctr={ctr}, band=({lo},{hi})"
+
+
+def test_counter_advances_in_process_not_in_frame_gen(tx):
     start = tx.frame_ctr
-    _ = tx._make_frame_chips()
-    assert tx.frame_ctr == start  # no change inside _make_frame_chips
+    tx._make_frame_chips()
+    assert tx.frame_ctr == start
 
-    samples = np.zeros(1000, dtype=np.float32)
-    _ = tx.process(samples)
-    assert tx.frame_ctr == start + 1  # increment happens in process()
+    tx.process(np.full(1000, 0.01, dtype=np.float32))
+    assert tx.frame_ctr == start + 1
 
 
-def test_payload_sealed_length_and_ctr_roundtrip(key, params):
-    """Payload must be 55 bytes and include the frame counter in plaintext (validated via decrypt)."""
-    tx = WatermarkEmbedder(key, params)
-    for ctr in [0, 1, 7, 255]:
+def test_payload_is_sealed_with_counter(key, tx):
+    sc = SecureChannel(key)
+    for ctr in (0, 1, 255, 65_535):
         tx.frame_ctr = ctr
         blob = tx._build_payload()
-        assert isinstance(blob, bytes) and len(blob) == 55
-        plain = SecureChannel(key).open(blob)
-        assert plain.startswith(b"ESAL")
+        assert len(blob) == 55
+        plain = sc.open(blob)
+        assert plain[:4] == b"ESAL"
         assert int.from_bytes(plain[4:8], "big") == ctr
 
 
-def test_chips_statistics_steady_state(key, params):
-    """Chips must be unit-RMS on the steady part (as normalized by the embedder)."""
-    tx = WatermarkEmbedder(key, params)
-    chips = tx._make_frame_chips()
-    steady = chips[STEADY_OFFSET:] if chips.size > STEADY_OFFSET else chips
-    mean = float(np.mean(steady))
-    rms  = float(np.sqrt(np.mean(steady ** 2)))
-    assert abs(mean) < 5e-3, f"Steady-state mean too large: {mean}"
-    assert abs(rms - 1.0) < 5e-3, f"Steady-state RMS not ~1: {rms}"
-
-
-def test_silence_gate_returns_input(key, params):
-    """Very quiet input should be returned unchanged (silence gate)."""
-    tx = WatermarkEmbedder(key, params)
-    # amplitude below MIN_RMS_SILENCE used in embedder
+def test_silence_gate_returns_input_unchanged(tx):
     samples = np.full(480, 1e-6, dtype=np.float32)
     out = tx.process(samples.copy())
-    assert np.allclose(out, samples, atol=1e-12), "Silence gate should return input unchanged"
+    assert np.allclose(out, samples, atol=1e-12)
 
 
-def test_no_clipping_headroom(key, params):
-    """Mixer must not clip: output peak <= MIX_HEADROOM."""
-    tx = WatermarkEmbedder(key, params)
-    # A hot block; watermark should be scaled down by limiter
+def test_mixer_respects_headroom(tx):
     samples = np.full(4096, 0.97, dtype=np.float32)
     out = tx.process(samples.copy())
-    assert float(np.max(np.abs(out))) <= 0.98001, "Output exceeded headroom limit"
+    assert float(np.max(np.abs(out))) <= MIX_HEADROOM + 1e-5
 
 
-def test_preamble_correlation_has_dominant_peak(key, params):
-    """
-    Filtered preamble should produce a strong correlation right at the frame start.
-    We use normalized cross-correlation (cosine similarity) at lag 0 and
-    require it to be a clear statistical outlier vs. other lags.
-    """
+def _wm_level_db(tx: WatermarkEmbedder, host: np.ndarray) -> float:
+    out = tx.process(host.copy())
+    wm = out - host
+    return 20 * np.log10(
+        (np.sqrt(np.mean(wm**2)) + EPS) / (np.sqrt(np.mean(host**2)) + EPS)
+    )
+
+
+def test_watermark_level_tracks_target_when_band_is_quiet(key):
+    """Speech-like host (energy < 3 kHz): hop bands are quiet, so the level
+    must sit at the -20 dB baseline."""
+    from scipy.signal import butter, lfilter
+
+    params = TxParams(target_rel_db=-20.0)
     tx = WatermarkEmbedder(key, params)
-    tx.frame_ctr = 3
-    chips = tx._make_frame_chips()
+    rng = np.random.default_rng(0)
+    b, a = butter(4, 3_000 / 24_000, "low")
+    host = lfilter(b, a, rng.standard_normal(96_000))
+    host = (host / np.sqrt(np.mean(host**2)) * 0.1).astype(np.float32)
 
-    # Build filtered preamble template in the same band
-    band = choose_band(tx.sec.master_key, tx.frame_ctr)
-    b, a = butter_bandpass(*band, tx.p.fs, order=4)
-    pre_bits = tx.mseq_63()
-    pre_sy = 2.0 * pre_bits.astype(np.float32) - 1.0
-
-    zi_len = max(len(a), len(b)) - 1
-    zi = np.zeros(zi_len, dtype=np.result_type(a, b, pre_sy))
-    tpl, _ = lfilter(b, a, pre_sy, zi=zi)
-    L = tpl.size
-
-    # --- NCC at start (lag 0) ---
-    seg0 = chips[:L]
-    denom0 = (np.linalg.norm(seg0) * np.linalg.norm(tpl)) + 1e-12
-    ncc0 = float(np.dot(seg0, tpl) / denom0)
-
-    # --- Sliding NCC over the rest of the frame (exclude a small start window) ---
-    START_WIN = max(16, zi_len)            # ignore early transient
-    ncc_vals = []
-    for i in range(START_WIN, chips.size - L + 1):
-        seg = chips[i:i+L]
-        denom = (np.linalg.norm(seg) * np.linalg.norm(tpl)) + 1e-12
-        ncc_vals.append(float(np.dot(seg, tpl) / denom))
-    ncc_vals = np.array(ncc_vals, dtype=np.float64)
-    if ncc_vals.size == 0:  # safety
-        pytest.skip("Frame too short after transient cut")
-
-    # --- Criteria ---
-    # 1) Start NCC should be healthy on an absolute scale (no crazy small value)
-    assert ncc0 > 0.35, f"Start NCC too low: {ncc0:.3f}"
-
-    # 2) Start NCC should be a statistical outlier vs. others (z-score)
-    mu = float(ncc_vals.mean())
-    sigma = float(ncc_vals.std() + 1e-12)
-    z = (ncc0 - mu) / sigma
-    assert z > 2.0, f"Preamble start NCC not dominant enough (z={z:.2f}, ncc0={ncc0:.3f})"
-
-    # 3) Also require it to exceed most other lags (95th percentile)
-    q95 = float(np.quantile(ncc_vals, 0.95))
-    assert ncc0 >= q95, f"Start NCC {ncc0:.3f} < 95th percentile {q95:.3f} of other lags"
+    assert abs(_wm_level_db(tx, host) - params.target_rel_db) < 2.0
 
 
-def test_choose_band_is_deterministic(key, params):
-    """choose_band must be a pure function of (key, frame_ctr)."""
-    for ctr in [0, 1, 5, 17, 255]:
-        assert choose_band(key, ctr) == choose_band(key, ctr)
+def test_watermark_level_rises_with_in_band_masking(key):
+    """Broadband host puts energy inside the hop band: the level must rise
+    towards the in-band host level (masking) but stay under the ceiling."""
+    params = TxParams(target_rel_db=-20.0, ceiling_rel_db=-12.0)
+    tx = WatermarkEmbedder(key, params)
+    rng = np.random.default_rng(0)
+    host = (rng.standard_normal(96_000) * 0.1).astype(np.float32)
+
+    level = _wm_level_db(tx, host)
+    assert params.target_rel_db - 1.0 < level <= params.ceiling_rel_db + 1.0
+    assert level > params.target_rel_db + 3.0  # actually boosted, not baseline
+
+
+def test_process_handles_arbitrary_block_sizes(tx):
+    """Chip buffering must survive block sizes unrelated to the frame length."""
+    rng = np.random.default_rng(1)
+    outs = []
+    for block in (480, 1024, 333, 96_000):
+        host = (rng.standard_normal(block) * 0.05).astype(np.float32)
+        outs.append(tx.process(host))
+    assert sum(o.size for o in outs) == 480 + 1024 + 333 + 96_000
+
+
+def test_rejects_wrong_codeword_length(key):
+    with pytest.raises(ValueError):
+        WatermarkEmbedder(key, TxParams(N=512))

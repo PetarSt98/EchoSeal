@@ -8,14 +8,15 @@
 #          echoseal-tx --key $(openssl rand -hex 32)
 #
 # Verify a file (no audio device needed):
-#   docker run --rm -v $PWD:/data echoseal \
-#          echoseal-rx --key <key> /data/recording.wav
+#   docker run --rm -v $PWD:/data echoseal:latest \
+#          echoseal-rx --key <key> --audio /data/recording.wav
 # ──────────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
-# 1) basic tools & build deps for numpy / scipy
+# 1) build deps for numpy/scipy + runtime libs for soundfile & sounddevice
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git libsndfile1-dev pkg-config \
+        build-essential git pkg-config \
+        libsndfile1-dev libportaudio2 \
     && rm -rf /var/lib/apt/lists/*
 
 # 2) copy source & install

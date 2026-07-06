@@ -30,15 +30,15 @@ def test_mild_noise_is_still_authentic(marked_10s):
 
 
 def test_phone_codec_lowpass_is_still_authentic(marked_10s):
-    """A modern phone/codec chain low-passes at ~14-16 kHz.  That kills the
-    two high hop bands, but frames keep arriving in the low bands — missing
-    frames are degradation, not tampering."""
-    taps = firwin(501, 14_000, fs=FS)
+    """A harsh phone/codec chain low-passes around ~10 kHz.  That attenuates
+    the 10–12 and 12–14 kHz hop bands, but 6–8 and 8–10 kHz frames survive —
+    missing frames are degradation, not tampering."""
+    taps = firwin(501, 10_000, fs=FS)
     clipped = lfilter(taps, 1.0, marked_10s).astype(np.float32)
 
     report = _analyze(clipped)
     assert report.verdict == "authentic"
-    assert len(report.hits) >= 3          # low-band frames survive
+    assert len(report.hits) >= 3          # lower hop bands survive
     assert not report.issues
 
 

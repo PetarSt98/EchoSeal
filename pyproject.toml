@@ -89,7 +89,7 @@ where = ["."]
 include = ["rtwm*", "gui*"]
 
 [tool.setuptools]
-py-modules = ["tx_app", "rx_app"]
+py-modules = ["tx_app", "rx_app", "ota_live_tx"]
 
 [build-system]
 requires      = ["setuptools>=65.0", "wheel"]
